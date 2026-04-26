@@ -1,0 +1,94 @@
+package by.losik;
+
+import by.losik.config.AppConfig;
+import by.losik.config.VertxConfig;
+import by.losik.verticle.FileProcessorVerticle;
+import by.losik.verticle.HttpVerticle;
+import io.vertx.core.DeploymentOptions;
+import io.vertx.core.ThreadingModel;
+import io.vertx.core.VertxOptions;
+import io.vertx.core.eventbus.EventBusOptions;
+import io.vertx.core.file.FileSystemOptions;
+import io.vertx.core.json.JsonObject;
+import io.vertx.core.metrics.MetricsOptions;
+import io.vertx.core.tracing.TracingOptions;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+public class Main {
+    private static final Logger log = LoggerFactory.getLogger(Main.class);
+
+    public static void main(String[] args) {
+        log.info("Starting File Storage Service");
+
+        String clusterName = System.getenv().getOrDefault("CLUSTER_NAME", "vertx-cluster");
+        log.debug("Cluster name: {}", clusterName);
+
+        JsonObject config = new JsonObject()
+                .put("http.port", Integer.parseInt(
+                        System.getenv().getOrDefault("HTTP_SERVER_PORT", "8080")))
+                .put("nfs.path",
+                        System.getenv().getOrDefault("NFS_MOUNT_PATH", "/mnt/nfs"))
+                .put("file.upload.timeout", Long.parseLong(
+                        System.getenv().getOrDefault("FILE_UPLOAD_TIMEOUT_MS", "30000")))
+                .put("cors.enabled", Boolean.parseBoolean(
+                        System.getenv().getOrDefault("CORS_ENABLED", "true")))
+                .put("cors.allowed.origins",
+                        System.getenv().getOrDefault("CORS_ALLOWED_ORIGINS", "*"))
+                .put("cors.allowed.methods",
+                        System.getenv().getOrDefault("CORS_ALLOWED_METHODS", "GET,POST,PUT,DELETE,OPTIONS"))
+                .put("cors.allowed.headers",
+                        System.getenv().getOrDefault("CORS_ALLOWED_HEADERS", "Content-Type,Authorization"))
+                .put("temp.file.path",
+                        System.getenv().getOrDefault("TEMP_FILE_PATH", "/tmp/file-uploads"))
+                .put("max.page.size", Integer.parseInt(
+                        System.getenv().getOrDefault("MAX_PAGE_SIZE", "1000")))
+                .put("default.page.size", Integer.parseInt(
+                        System.getenv().getOrDefault("DEFAULT_PAGE_SIZE", "100")))
+                .put("cluster.name", clusterName)
+                .put("node.id",
+                        System.getenv().getOrDefault("NODE_ID", "node-" + System.currentTimeMillis()));
+
+        log.info("Configuration loaded: HTTP Port={}, NFS Path={}, Upload Timeout={}ms, CORS Enabled={}",
+                config.getInteger("http.port"),
+                config.getString("nfs.path"),
+                config.getLong("file.upload.timeout"),
+                config.getBoolean("cors.enabled"));
+
+        System.setProperty("vertx.infinispan.config", "cluster.xml");
+
+        AppConfig.load(config);
+
+        VertxOptions vertxOptions = new VertxOptions()
+                .setFileSystemOptions(new FileSystemOptions())
+                .setMetricsOptions(new MetricsOptions().setEnabled(true))
+                .setTracingOptions(new TracingOptions())
+                .setEventBusOptions(new EventBusOptions());
+
+        VertxConfig.initVertx(vertxOptions);
+
+        Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+            log.info("Shutdown hook triggered, closing Vert.x instance");
+            VertxConfig.vertx().close();
+            log.info("Vert.x instance closed");
+        }));
+
+        int fsVerticles = Integer.parseInt(System.getenv().getOrDefault("FS_VERTICLES", "2"));
+        log.info("Deploying {} FileProcessorVerticle instance(s)", fsVerticles);
+        VertxConfig.vertx().deployVerticle(FileProcessorVerticle.class,
+                        new DeploymentOptions().setInstances(fsVerticles)
+                                .setHa(true).setThreadingModel(ThreadingModel.WORKER))
+                .onSuccess(deploymentId -> log.info("FileProcessorVerticle deployed successfully with ID: {}", deploymentId))
+                .onFailure(err -> log.error("Failed to deploy FileProcessorVerticle: {}", err.getMessage(), err));
+
+        int httpVerticles = Integer.parseInt(System.getenv().getOrDefault("HTTP_VERTICLES", "1"));
+        log.info("Deploying {} HttpVerticle instance(s)", httpVerticles);
+        VertxConfig.vertx().deployVerticle(HttpVerticle.class,
+                        new DeploymentOptions().setInstances(httpVerticles)
+                                .setHa(true))
+                .onSuccess(deploymentId -> log.info("HttpVerticle deployed successfully with ID: {}", deploymentId))
+                .onFailure(err -> log.error("Failed to deploy HttpVerticle: {}", err.getMessage(), err));
+
+        log.info("File Storage Service started successfully");
+    }
+}

@@ -1,0 +1,9 @@
+infinispan-indexes-*
+settings.gradle
+gradlew.bat
+gradle
+.idea
+.gradle
+build
+temp-uploads
+gradlew
