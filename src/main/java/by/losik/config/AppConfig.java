@@ -18,6 +18,10 @@ public class AppConfig {
         return config.get().getInteger("http.port", 8080);
     }
 
+    public static int metricsPort() {
+        return config.get().getInteger("metrics.port", 8079);
+    }
+
     public static String nfsPath() {
         return config.get().getString("nfs.path", "/mnt/nfs");
     }

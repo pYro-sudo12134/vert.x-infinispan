@@ -80,12 +80,14 @@ public class FileProcessorVerticle extends AbstractVerticle {
         EventBusConfig.eventBus().consumer(EventBusConfig.FILE_DELETE_ADDRESS, this::handleRequest);
         EventBusConfig.eventBus().consumer(EventBusConfig.FILE_LIST_ADDRESS, this::handleRequest);
         EventBusConfig.eventBus().consumer(EventBusConfig.FILE_UPDATE_ADDRESS, this::handleRequest);
-        log.info("EventBus consumers registered for addresses: {}, {}, {}, {}, {}",
+        EventBusConfig.eventBus().consumer(EventBusConfig.FILE_DOWNLOAD_ADDRESS, this::handleRequest);
+        log.info("EventBus consumers registered for addresses: {}, {}, {}, {}, {}, {}",
                 EventBusConfig.FILE_UPLOAD_ADDRESS,
                 EventBusConfig.FILE_GET_ADDRESS,
                 EventBusConfig.FILE_DELETE_ADDRESS,
                 EventBusConfig.FILE_LIST_ADDRESS,
-                EventBusConfig.FILE_UPDATE_ADDRESS);
+                EventBusConfig.FILE_UPDATE_ADDRESS,
+                EventBusConfig.FILE_DOWNLOAD_ADDRESS);
     }
 
     private void handleRequest(@NotNull Message<Object> message) {
@@ -115,6 +117,7 @@ public class FileProcessorVerticle extends AbstractVerticle {
             case AppConstants.ACTION_DELETE -> this::handleDelete;
             case AppConstants.ACTION_GET -> this::handleGet;
             case AppConstants.ACTION_LIST -> this::handleList;
+            case AppConstants.ACTION_DOWNLOAD -> this::handleDownload;
             default -> null;
         };
     }
@@ -392,6 +395,46 @@ public class FileProcessorVerticle extends AbstractVerticle {
         }
     }
 
+    private void handleDownload(@NotNull JsonObject msg, Message<Object> message) {
+        String fileId = msg.getString(AppConstants.FIELD_FILE_ID);
+        log.info("Handling download: fileId={}", fileId);
+
+        fileMetadataMap.get(fileId, getResult -> {
+            if (getResult.succeeded() && getResult.result() != null) {
+                FileMetadata metadata = getResult.result();
+                String filePath = metadata.getFilePath();
+
+                log.debug("Download requested for fileId={}, path={}", fileId, filePath);
+
+                vertx.fileSystem().exists(filePath, existsResult -> {
+                    if (existsResult.succeeded() && existsResult.result()) {
+                        vertx.fileSystem().props(filePath, propsResult -> {
+                            if (propsResult.succeeded()) {
+                                JsonObject response = new JsonObject()
+                                        .put(AppConstants.FIELD_STATUS, AppConstants.STATUS_OK)
+                                        .put(AppConstants.FIELD_FILE_PATH, filePath)
+                                        .put(AppConstants.FIELD_FILE_NAME, metadata.getFileName())
+                                        .put(AppConstants.FIELD_CONTENT_TYPE, metadata.getContentType())
+                                        .put(AppConstants.FIELD_SIZE, propsResult.result().size());
+                                message.reply(response);
+                                log.info("Download prepared: fileId={}, size={}", fileId, propsResult.result().size());
+                            } else {
+                                log.error("Failed to get file properties for fileId={}: {}", fileId, propsResult.cause().getMessage());
+                                message.fail(AppConstants.HTTP_INTERNAL_ERROR, "Failed to get file properties");
+                            }
+                        });
+                    } else {
+                        log.warn("Download failed - file not found on disk: fileId={}, path={}", fileId, filePath);
+                        message.fail(AppConstants.HTTP_NOT_FOUND, AppConstants.ERR_FILE_NOT_FOUND);
+                    }
+                });
+            } else {
+                log.warn("Download failed - metadata not found: fileId={}", fileId);
+                message.fail(AppConstants.HTTP_NOT_FOUND, AppConstants.ERR_FILE_NOT_FOUND);
+            }
+        });
+    }
+
     private void handleListFallback(@NotNull JsonObject msg, Message<Object> message) {
         int page = msg.getInteger(AppConstants.FIELD_PAGE, 1);
         int size = msg.getInteger(AppConstants.FIELD_SIZE, AppConfig.defaultPageSize());
@@ -448,7 +491,7 @@ public class FileProcessorVerticle extends AbstractVerticle {
         }
     }
 
-    private void processResults(List<FileMetadata> metadata, int page, int size, String sort, boolean asc, Message<Object> message) {
+    private void processResults(@NotNull List<FileMetadata> metadata, int page, int size, String sort, boolean asc, Message<Object> message) {
         metadata.sort((a, b) -> {
             int cmp = switch (sort) {
                 case "size" -> Long.compare(a.getSize(), b.getSize());

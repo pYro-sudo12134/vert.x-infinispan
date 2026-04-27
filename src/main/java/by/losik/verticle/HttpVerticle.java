@@ -6,6 +6,8 @@ import by.losik.config.RouterConfig;
 import by.losik.constant.AppConstants;
 import io.vertx.core.AbstractVerticle;
 import io.vertx.core.eventbus.DeliveryOptions;
+import io.vertx.core.file.AsyncFile;
+import io.vertx.core.file.OpenOptions;
 import io.vertx.core.http.HttpMethod;
 import io.vertx.core.json.JsonObject;
 import io.vertx.ext.web.Router;
@@ -63,6 +65,7 @@ public class HttpVerticle extends AbstractVerticle {
         router.delete("/files/:id").handler(this::deleteFile);
         router.put("/files/:id").handler(this::updateFile);
         router.get("/files").handler(this::listFiles);
+        router.get("/download/:id").handler(this::downloadFile);
         router.get("/health").handler(ctx -> {
             log.debug("Health check request received");
             ctx.response().end(AppConstants.STATUS_OK);
@@ -245,6 +248,51 @@ public class HttpVerticle extends AbstractVerticle {
                 ctx.response()
                         .setStatusCode(AppConstants.HTTP_INTERNAL_ERROR)
                         .end(AppConstants.ERR_LIST_FAILED);
+            }
+        });
+    }
+
+    private void downloadFile(@NotNull RoutingContext ctx) {
+        String fileId = ctx.pathParam(AppConstants.FIELD_ID);
+        log.info("Received download request: fileId={}", fileId);
+
+        var message = new JsonObject()
+                .put(AppConstants.FIELD_ACTION, AppConstants.ACTION_DOWNLOAD)
+                .put(AppConstants.FIELD_FILE_ID, fileId);
+
+        EventBusConfig.eventBus().request(EventBusConfig.FILE_DOWNLOAD_ADDRESS, message, reply -> {
+            if (reply.succeeded()) {
+                JsonObject response = (JsonObject) reply.result().body();
+                String filePath = response.getString(AppConstants.FIELD_FILE_PATH);
+                String fileName = response.getString(AppConstants.FIELD_FILE_NAME);
+                String contentType = response.getString(AppConstants.FIELD_CONTENT_TYPE);
+                long size = response.getLong(AppConstants.FIELD_SIZE);
+
+                ctx.response()
+                        .setStatusCode(AppConstants.HTTP_OK)
+                        .putHeader("Content-Type", contentType)
+                        .putHeader("Content-Disposition", "attachment; filename=\"" + fileName + "\"")
+                        .putHeader("Content-Length", String.valueOf(size));
+
+                vertx.fileSystem().open(filePath, new OpenOptions().setRead(true), openResult -> {
+                    if (openResult.succeeded()) {
+                        AsyncFile asyncFile = openResult.result();
+                        asyncFile.pipeTo(ctx.response())
+                                .onSuccess(v -> log.info("Download completed: fileId={}, fileName={}, size={}", fileId, fileName, size))
+                                .onFailure(err -> {
+                                    log.error("Pipe failed for fileId={}", fileId, err);
+                                    if (!ctx.response().ended()) {
+                                        ctx.response().setStatusCode(AppConstants.HTTP_INTERNAL_ERROR).end("Download failed");
+                                    }
+                                });
+                    } else {
+                        ctx.response().setStatusCode(AppConstants.HTTP_INTERNAL_ERROR).end("Failed to open file");
+                    }
+                });
+            } else {
+                ctx.response()
+                        .setStatusCode(AppConstants.HTTP_NOT_FOUND)
+                        .end(AppConstants.ERR_FILE_NOT_FOUND);
             }
         });
     }

@@ -1,17 +1,25 @@
 package by.losik;
 
 import by.losik.config.AppConfig;
+import by.losik.config.MetricsConfig;
 import by.losik.config.VertxConfig;
 import by.losik.verticle.FileProcessorVerticle;
 import by.losik.verticle.HttpVerticle;
+import io.micrometer.core.instrument.binder.jvm.JvmGcMetrics;
+import io.micrometer.core.instrument.binder.jvm.JvmMemoryMetrics;
+import io.micrometer.core.instrument.binder.jvm.JvmThreadMetrics;
+import io.micrometer.core.instrument.binder.system.ProcessorMetrics;
+import io.micrometer.prometheus.PrometheusConfig;
+import io.micrometer.prometheus.PrometheusMeterRegistry;
 import io.vertx.core.DeploymentOptions;
 import io.vertx.core.ThreadingModel;
 import io.vertx.core.VertxOptions;
 import io.vertx.core.eventbus.EventBusOptions;
 import io.vertx.core.file.FileSystemOptions;
 import io.vertx.core.json.JsonObject;
-import io.vertx.core.metrics.MetricsOptions;
-import io.vertx.core.tracing.TracingOptions;
+import io.vertx.micrometer.MicrometerMetricsOptions;
+import io.vertx.micrometer.VertxPrometheusOptions;
+import io.vertx.micrometer.backends.BackendRegistries;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -27,6 +35,8 @@ public class Main {
         JsonObject config = new JsonObject()
                 .put("http.port", Integer.parseInt(
                         System.getenv().getOrDefault("HTTP_SERVER_PORT", "8080")))
+                .put("metrics.port", Integer.parseInt(
+                        System.getenv().getOrDefault("METRICS_PORT", "8079")))
                 .put("nfs.path",
                         System.getenv().getOrDefault("NFS_MOUNT_PATH", "/mnt/nfs"))
                 .put("file.upload.timeout", Long.parseLong(
@@ -59,10 +69,26 @@ public class Main {
 
         AppConfig.load(config);
 
+        PrometheusMeterRegistry prometheusRegistry = new PrometheusMeterRegistry(PrometheusConfig.DEFAULT);
+
+        new JvmGcMetrics().bindTo(prometheusRegistry);
+        new JvmMemoryMetrics().bindTo(prometheusRegistry);
+        new JvmThreadMetrics().bindTo(prometheusRegistry);
+        new ProcessorMetrics().bindTo(prometheusRegistry);
+
+        MicrometerMetricsOptions metricsOptions = new MicrometerMetricsOptions()
+                .setPrometheusOptions(new VertxPrometheusOptions()
+                        .setEnabled(true)
+                        .setStartEmbeddedServer(true)
+                        .setPublishQuantiles(true)
+                        .setPublishQuantiles(true))
+                .setEnabled(true);
+
+        BackendRegistries.setupBackend(metricsOptions, prometheusRegistry);
+
         VertxOptions vertxOptions = new VertxOptions()
                 .setFileSystemOptions(new FileSystemOptions())
-                .setMetricsOptions(new MetricsOptions().setEnabled(true))
-                .setTracingOptions(new TracingOptions())
+                .setMetricsOptions(metricsOptions)
                 .setEventBusOptions(new EventBusOptions());
 
         VertxConfig.initVertx(vertxOptions);
@@ -88,6 +114,8 @@ public class Main {
                                 .setHa(true))
                 .onSuccess(deploymentId -> log.info("HttpVerticle deployed successfully with ID: {}", deploymentId))
                 .onFailure(err -> log.error("Failed to deploy HttpVerticle: {}", err.getMessage(), err));
+
+        MetricsConfig.setupMetricsServer();
 
         log.info("File Storage Service started successfully");
     }

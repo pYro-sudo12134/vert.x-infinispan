@@ -24,6 +24,6 @@ RUN mkdir -p /mnt/nfs && \
 
 USER vertx:vertx
 
-EXPOSE 8080 7800
+EXPOSE 8080 8079 7800
 
 ENTRYPOINT ["java", "-jar", "-Djava.io.tmpdir=/tmp", "app.jar"]
