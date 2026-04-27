@@ -16,11 +16,10 @@ public class MetricsConfig {
         Router router = RouterConfig.router();
 
         router.get("/metrics").handler(ctx -> {
-            PrometheusMeterRegistry registry = (PrometheusMeterRegistry) BackendRegistries.getDefaultNow();
             Optional.ofNullable((PrometheusMeterRegistry) BackendRegistries.getDefaultNow())
                     .ifPresentOrElse(prometheusMeterRegistry -> ctx.response()
                                     .putHeader("Content-Type", "text/plain; version=0.0.4")
-                                    .end(registry.scrape()),
+                                    .end(prometheusMeterRegistry.scrape()),
                             () -> ctx.response()
                                     .setStatusCode(AppConstants.HTTP_INTERNAL_ERROR)
                                     .end("Metrics registry not available"));
