@@ -6,7 +6,7 @@ import org.jetbrains.annotations.NotNull;
 
 public class RouterConfig {
     @Contract(" -> new")
-    public static @NotNull Router router() {
+    public static synchronized @NotNull Router createRouter() {
         return Router.router(VertxConfig.vertx());
     }
 }

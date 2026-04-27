@@ -30,7 +30,7 @@ public class HttpVerticle extends AbstractVerticle {
     public void start() {
         log.info("Starting HttpVerticle on port: {}", AppConfig.httpPort());
 
-        Router router = RouterConfig.router();
+        Router router = RouterConfig.createRouter();
 
         if (AppConfig.corsEnabled()) {
             CorsHandler corsHandler = CorsHandler.create();

@@ -12,7 +12,7 @@ import org.jetbrains.annotations.NotNull;
 public class ClusterManagerConfig {
     private static ClusterManager clusterManagerInstance;
     @Contract(" -> new")
-    public static @NotNull ClusterManager initClusterManager() {
+    public static synchronized @NotNull ClusterManager initClusterManager() {
         if(clusterManagerInstance == null) {
             System.setProperty("jgroups.bind_addr", System.getenv().getOrDefault("JGROUPS_BIND_ADDR", "0.0.0.0"));
             System.setProperty("jgroups.tcp.port", System.getenv().getOrDefault("JGROUPS_TCP_PORT", "7800"));

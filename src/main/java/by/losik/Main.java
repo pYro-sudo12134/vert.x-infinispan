@@ -13,6 +13,7 @@ import io.micrometer.prometheus.PrometheusConfig;
 import io.micrometer.prometheus.PrometheusMeterRegistry;
 import io.vertx.core.DeploymentOptions;
 import io.vertx.core.ThreadingModel;
+import io.vertx.core.Vertx;
 import io.vertx.core.VertxOptions;
 import io.vertx.core.eventbus.EventBusOptions;
 import io.vertx.core.file.FileSystemOptions;
@@ -22,6 +23,9 @@ import io.vertx.micrometer.VertxPrometheusOptions;
 import io.vertx.micrometer.backends.BackendRegistries;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 
 public class Main {
     private static final Logger log = LoggerFactory.getLogger(Main.class);
@@ -33,6 +37,9 @@ public class Main {
         log.debug("Cluster name: {}", clusterName);
 
         JsonObject config = new JsonObject()
+                .put("clustered", Boolean.parseBoolean(
+                        System.getenv().getOrDefault("CLUSTERED", "false")
+                ))
                 .put("http.port", Integer.parseInt(
                         System.getenv().getOrDefault("HTTP_SERVER_PORT", "8080")))
                 .put("metrics.port", Integer.parseInt(
@@ -59,7 +66,8 @@ public class Main {
                 .put("node.id",
                         System.getenv().getOrDefault("NODE_ID", "node-" + System.currentTimeMillis()));
 
-        log.info("Configuration loaded: HTTP Port={}, NFS Path={}, Upload Timeout={}ms, CORS Enabled={}",
+        log.info("Configuration loaded: Clustered={} HTTP Port={}, NFS Path={}, Upload Timeout={}ms, CORS Enabled={}",
+                config.getBoolean("clustered"),
                 config.getInteger("http.port"),
                 config.getString("nfs.path"),
                 config.getLong("file.upload.timeout"),
@@ -80,7 +88,6 @@ public class Main {
                 .setPrometheusOptions(new VertxPrometheusOptions()
                         .setEnabled(true)
                         .setStartEmbeddedServer(true)
-                        .setPublishQuantiles(true)
                         .setPublishQuantiles(true))
                 .setEnabled(true);
 
@@ -91,12 +98,35 @@ public class Main {
                 .setMetricsOptions(metricsOptions)
                 .setEventBusOptions(new EventBusOptions());
 
-        VertxConfig.initVertx(vertxOptions);
+        VertxConfig.initVertx(vertxOptions, AppConfig.isClustered());
 
         Runtime.getRuntime().addShutdownHook(new Thread(() -> {
             log.info("Shutdown hook triggered, closing Vert.x instance");
-            VertxConfig.vertx().close();
-            log.info("Vert.x instance closed");
+
+            CountDownLatch latch = new CountDownLatch(1);
+            Vertx vertx = VertxConfig.vertx();
+            long startTime = System.currentTimeMillis();
+
+            vertx.close().onComplete(ar -> {
+                long duration = System.currentTimeMillis() - startTime;
+                if (ar.succeeded()) {
+                    log.info("Vert.x instance closed gracefully in {} ms", duration);
+                } else {
+                    log.error("Failed to close Vert.x instance after {} ms", duration, ar.cause());
+                }
+                latch.countDown();
+            });
+
+            try {
+                if (!latch.await(30, TimeUnit.SECONDS)) {
+                    log.warn("Vert.x instance did not close within 30 seconds, forcing shutdown");
+                }
+            } catch (InterruptedException e) {
+                log.warn("Shutdown interrupted", e);
+                Thread.currentThread().interrupt();
+            }
+
+            log.info("Shutdown hook finished");
         }));
 
         int fsVerticles = Integer.parseInt(System.getenv().getOrDefault("FS_VERTICLES", "2"));

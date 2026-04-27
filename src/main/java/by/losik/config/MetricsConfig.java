@@ -12,8 +12,8 @@ import java.util.Optional;
 
 public class MetricsConfig {
     private static final Logger log = LoggerFactory.getLogger(MetricsConfig.class);
-    public static void setupMetricsServer() {
-        Router router = RouterConfig.router();
+    public static synchronized void setupMetricsServer() {
+        Router router = RouterConfig.createRouter();
 
         router.get("/metrics").handler(ctx -> {
             Optional.ofNullable((PrometheusMeterRegistry) BackendRegistries.getDefaultNow())

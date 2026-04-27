@@ -14,6 +14,10 @@ public class AppConfig {
         return config.get();
     }
 
+    public static boolean isClustered() {
+        return config.get().getBoolean("clustered", false);
+    }
+
     public static int httpPort() {
         return config.get().getInteger("http.port", 8080);
     }
