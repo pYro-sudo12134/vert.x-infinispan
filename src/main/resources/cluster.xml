@@ -1,15 +1,29 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <infinispan xmlns="urn:infinispan:config:14.0">
+
     <cache-container name="vertx-cluster-manager"
                      default-cache="default"
                      statistics="true">
-
         <transport stack="${jgroups.stack:tcp}"
                    node-name="${infinispan.node.name:}"
                    cluster="${infinispan.cluster.name:vertx-cluster}"/>
 
+        <serialization>
+            <context-initializer class="by.losik.meta.FileMetadataInitializerImpl"/>
+
+        </serialization>
+
         <distributed-cache name="default">
             <encoding media-type="application/x-java-object"/>
+        </distributed-cache>
+
+        <distributed-cache name="file.metadata.indexed">
+            <encoding media-type="application/x-protostream"/>
+            <indexing storage="filesystem" path="${java.io.tmpdir:/tmp/infinispan-indexes}" startup-mode="auto">
+                <indexed-entities>
+                    <indexed-entity>by.losik.meta.FileMetadata</indexed-entity>
+                </indexed-entities>
+            </indexing>
         </distributed-cache>
 
         <replicated-cache name="__vertx.subs">

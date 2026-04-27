@@ -5,6 +5,7 @@ import io.vertx.ext.cluster.infinispan.InfinispanClusterManager;
 import org.infinispan.api.exception.InfinispanException;
 import org.infinispan.configuration.global.GlobalConfigurationBuilder;
 import org.infinispan.jboss.marshalling.core.JBossUserMarshaller;
+import org.infinispan.manager.EmbeddedCacheManager;
 import org.jetbrains.annotations.Contract;
 import org.jetbrains.annotations.NotNull;
 
@@ -32,5 +33,13 @@ public class ClusterManagerConfig {
         }
 
         return clusterManagerInstance;
+    }
+
+    public static EmbeddedCacheManager getCacheContainer() {
+        ClusterManager cm = clusterManager();
+        if (cm instanceof InfinispanClusterManager) {
+            return (EmbeddedCacheManager) ((InfinispanClusterManager) cm).getCacheContainer();
+        }
+        throw new InfinispanException("ClusterManager is not InfinispanClusterManager");
     }
 }

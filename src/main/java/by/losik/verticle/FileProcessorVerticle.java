@@ -1,9 +1,11 @@
 package by.losik.verticle;
 
 import by.losik.config.AppConfig;
+import by.losik.config.ClusterManagerConfig;
 import by.losik.config.EventBusConfig;
 import by.losik.constant.AppConstants;
 import by.losik.meta.FileMetadata;
+import by.losik.service.FileQueryService;
 import io.vertx.core.AbstractVerticle;
 import io.vertx.core.Promise;
 import io.vertx.core.eventbus.Message;
@@ -11,6 +13,10 @@ import io.vertx.core.json.JsonArray;
 import io.vertx.core.json.JsonObject;
 import io.vertx.core.shareddata.AsyncMap;
 import io.vertx.core.shareddata.Lock;
+import io.vertx.core.streams.ReadStream;
+import io.vertx.ext.cluster.infinispan.InfinispanAsyncMap;
+import org.infinispan.Cache;
+import org.infinispan.manager.EmbeddedCacheManager;
 import org.jetbrains.annotations.NotNull;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -21,13 +27,17 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
 import java.util.Optional;
 import java.util.concurrent.atomic.AtomicInteger;
 
 public class FileProcessorVerticle extends AbstractVerticle {
     private static final Logger log = LoggerFactory.getLogger(FileProcessorVerticle.class);
     private static final String FILE_METADATA_MAP = "file.metadata";
+    private static final String FILE_METADATA_MAP_INDEXED = "file.metadata.indexed";
     private AsyncMap<String, FileMetadata> fileMetadataMap;
+    private FileQueryService queryService;
     private String nfsPath;
 
     @Override
@@ -41,8 +51,7 @@ public class FileProcessorVerticle extends AbstractVerticle {
         vertx.sharedData().<String, FileMetadata>getClusterWideMap(FILE_METADATA_MAP, ar -> {
             if (ar.succeeded()) {
                 fileMetadataMap = ar.result();
-
-                log.info("File metadata map successfully initialized");
+                initQueryService();
                 setupEventBusConsumer();
                 startPromise.complete();
                 log.info("FileProcessorVerticle started successfully");
@@ -51,6 +60,17 @@ public class FileProcessorVerticle extends AbstractVerticle {
                 startPromise.fail(ar.cause());
             }
         });
+    }
+
+    private void initQueryService() {
+        try {
+            EmbeddedCacheManager cacheManager = ClusterManagerConfig.getCacheContainer();
+            Cache<String, FileMetadata> indexedCache = cacheManager.getCache(FILE_METADATA_MAP_INDEXED);
+            queryService = new FileQueryService(vertx, indexedCache);
+            log.info("QueryService initialized successfully with indexed cache");
+        } catch (Exception e) {
+            log.warn("Failed to initialize QueryService, falling back to slow list: {}", e.getMessage());
+        }
     }
 
     private void setupEventBusConsumer() {
@@ -136,6 +156,8 @@ public class FileProcessorVerticle extends AbstractVerticle {
                                             .onFailure(err -> log.warn("Temp file cleanup failed: {}", tempPath, err));
 
                                     if (putResult.succeeded()) {
+                                        syncToIndexedCache(fileId, metadata);
+
                                         vertx.fileSystem().delete(tempPath, deleteResult -> {
                                             if (deleteResult.failed()) {
                                                 log.error("Failed to delete temp file: {}, error: {}", tempPath, deleteResult.cause().getMessage());
@@ -190,7 +212,7 @@ public class FileProcessorVerticle extends AbstractVerticle {
                     }
 
                     FileMetadata oldMetadata = getResult.result();
-                    log.debug("Found existing file: fileId={}, oldPath={}", fileId, oldMetadata.filePath());
+                    log.debug("Found existing file: fileId={}, oldPath={}", fileId, oldMetadata.getFilePath());
 
                     vertx.fileSystem().props(tempPath, propsResult -> {
                         long size = propsResult.succeeded() ? propsResult.result().size() : 0;
@@ -198,14 +220,14 @@ public class FileProcessorVerticle extends AbstractVerticle {
 
                         var newMetadata = new FileMetadata(
                                 fileId, fileName, targetPath, contentType,
-                                size, oldMetadata.createdAt(), now
+                                size, oldMetadata.getCreatedAt(), now
                         );
 
-                        vertx.fileSystem().delete(oldMetadata.filePath(), deleteResult -> {
+                        vertx.fileSystem().delete(oldMetadata.getFilePath(), deleteResult -> {
                             if (deleteResult.failed()) {
-                                log.warn("Failed to delete old file {}: {}", oldMetadata.filePath(), deleteResult.cause().getMessage());
+                                log.warn("Failed to delete old file {}: {}", oldMetadata.getFilePath(), deleteResult.cause().getMessage());
                             } else {
-                                log.debug("Old file deleted: {}", oldMetadata.filePath());
+                                log.debug("Old file deleted: {}", oldMetadata.getFilePath());
                             }
 
                             vertx.fileSystem().copy(tempPath, targetPath, copyResult -> {
@@ -216,6 +238,8 @@ public class FileProcessorVerticle extends AbstractVerticle {
                                                 .onFailure(err -> log.warn("Temp file cleanup failed: {}", tempPath, err));
 
                                         if (putResult.succeeded()) {
+                                            syncToIndexedCache(fileId, newMetadata);
+
                                             releaseLock.run();
                                             log.info("Update completed successfully: fileId={}, newFileName={}, size={}", fileId, fileName, size);
                                             message.reply(new JsonObject().put(AppConstants.FIELD_STATUS, AppConstants.STATUS_UPDATED));
@@ -254,15 +278,18 @@ public class FileProcessorVerticle extends AbstractVerticle {
                     if (removeResult.succeeded()) {
                         FileMetadata metadata = removeResult.result();
                         if (metadata != null) {
-                            log.debug("Metadata removed for fileId={}, path={}", fileId, metadata.filePath());
-                            vertx.fileSystem().delete(metadata.filePath(), deleteResult -> {
+                            log.debug("Metadata removed for fileId={}, path={}", fileId, metadata.getFilePath());
+
+                            removeFromIndexedCache(fileId);
+
+                            vertx.fileSystem().delete(metadata.getFilePath(), deleteResult -> {
                                 releaseLock.run();
                                 if (deleteResult.succeeded()) {
                                     log.info("Delete completed successfully: fileId={}", fileId);
                                     message.reply(new JsonObject().put(AppConstants.FIELD_STATUS, AppConstants.STATUS_DELETED));
                                 } else {
                                     log.warn("File deleted but physical file may remain: fileId={}, path={}, error={}",
-                                            fileId, metadata.filePath(), deleteResult.cause().getMessage());
+                                            fileId, metadata.getFilePath(), deleteResult.cause().getMessage());
                                     message.reply(new JsonObject().put(AppConstants.FIELD_STATUS, AppConstants.STATUS_DELETED_BUT_FILE_MAY_REMAIN));
                                 }
                             });
@@ -287,14 +314,14 @@ public class FileProcessorVerticle extends AbstractVerticle {
                 Optional.ofNullable(getResult.result())
                         .ifPresentOrElse(
                                 metadata -> {
-                                    log.debug("Metadata found for fileId={}, fileName={}", fileId, metadata.fileName());
+                                    log.debug("Metadata found for fileId={}, fileName={}", fileId, metadata.getFileName());
                                     message.reply(new JsonObject()
-                                            .put(AppConstants.FIELD_FILE_ID, metadata.fileId())
-                                            .put(AppConstants.FIELD_FILE_NAME, metadata.fileName())
-                                            .put(AppConstants.FIELD_CONTENT_TYPE, metadata.contentType())
-                                            .put(AppConstants.FIELD_FILE_PATH, metadata.filePath())
-                                            .put(AppConstants.FIELD_CREATED_AT, metadata.createdAt().toString())
-                                            .put(AppConstants.FIELD_UPDATED_AT, metadata.updatedAt().toString()));
+                                            .put(AppConstants.FIELD_FILE_ID, metadata.getFileId())
+                                            .put(AppConstants.FIELD_FILE_NAME, metadata.getFileName())
+                                            .put(AppConstants.FIELD_CONTENT_TYPE, metadata.getContentType())
+                                            .put(AppConstants.FIELD_FILE_PATH, metadata.getFilePath())
+                                            .put(AppConstants.FIELD_CREATED_AT, metadata.getCreatedAt().toString())
+                                            .put(AppConstants.FIELD_UPDATED_AT, metadata.getUpdatedAt().toString()));
                                 },
                                 () -> vertx.executeBlocking(promise -> {
                                     try (DirectoryStream<Path> stream = Files.newDirectoryStream(
@@ -320,13 +347,16 @@ public class FileProcessorVerticle extends AbstractVerticle {
                                                 );
                                                 fileMetadataMap.put(fileId, newMetadata, putResult -> {
                                                     log.info("Discovered file from NFS: {}", fileId);
+
+                                                    syncToIndexedCache(fileId, newMetadata);
+
                                                     message.reply(new JsonObject()
-                                                            .put(AppConstants.FIELD_FILE_ID, newMetadata.fileId())
-                                                            .put(AppConstants.FIELD_FILE_NAME, newMetadata.fileName())
-                                                            .put(AppConstants.FIELD_CONTENT_TYPE, newMetadata.contentType())
-                                                            .put(AppConstants.FIELD_FILE_PATH, newMetadata.filePath())
-                                                            .put(AppConstants.FIELD_CREATED_AT, newMetadata.createdAt().toString())
-                                                            .put(AppConstants.FIELD_UPDATED_AT, newMetadata.updatedAt().toString()));
+                                                            .put(AppConstants.FIELD_FILE_ID, newMetadata.getFileId())
+                                                            .put(AppConstants.FIELD_FILE_NAME, newMetadata.getFileName())
+                                                            .put(AppConstants.FIELD_CONTENT_TYPE, newMetadata.getContentType())
+                                                            .put(AppConstants.FIELD_FILE_PATH, newMetadata.getFilePath())
+                                                            .put(AppConstants.FIELD_CREATED_AT, newMetadata.getCreatedAt().toString())
+                                                            .put(AppConstants.FIELD_UPDATED_AT, newMetadata.getUpdatedAt().toString()));
                                                 });
                                             } else {
                                                 message.fail(AppConstants.HTTP_NOT_FOUND, AppConstants.ERR_FILE_NOT_FOUND);
@@ -346,84 +376,112 @@ public class FileProcessorVerticle extends AbstractVerticle {
         size = Math.min(size, AppConfig.maxPageSize());
         String prefix = msg.getString(AppConstants.FIELD_PREFIX, "");
         String sort = msg.getString(AppConstants.FIELD_SORT, "name");
-        boolean asc = !AppConstants.ORDER_DESC.equals(msg.getString(AppConstants.FIELD_ORDER, "asc"));
+        String order = msg.getString(AppConstants.FIELD_ORDER, "asc");
+
+        if (queryService != null) {
+            log.debug("Using QueryService for list");
+            queryService.listFiles(page, size, prefix, sort, order)
+                    .onSuccess(message::reply)
+                    .onFailure(err -> {
+                        log.error("QueryService list failed", err);
+                        message.fail(AppConstants.HTTP_INTERNAL_ERROR, AppConstants.ERR_LIST_FAILED);
+                    });
+        } else {
+            log.debug("Using fallback list (slow)");
+            handleListFallback(msg, message);
+        }
+    }
+
+    private void handleListFallback(@NotNull JsonObject msg, Message<Object> message) {
+        int page = msg.getInteger(AppConstants.FIELD_PAGE, 1);
+        int size = msg.getInteger(AppConstants.FIELD_SIZE, AppConfig.defaultPageSize());
+        size = Math.min(size, AppConfig.maxPageSize());
+        String prefix = msg.getString(AppConstants.FIELD_PREFIX, "");
+        String sort = msg.getString(AppConstants.FIELD_SORT, "name");
+        String order = msg.getString(AppConstants.FIELD_ORDER, "asc");
+        boolean asc = !"desc".equalsIgnoreCase(order);
         int finalSize = size;
 
-        log.debug("Handling list request: page={}, size={}, prefix={}, sort={}, asc={}", page, size, prefix, sort, asc);
+        try {
+            InfinispanAsyncMap<String, FileMetadata> infinispanMap = InfinispanAsyncMap.unwrap(fileMetadataMap);
+            ReadStream<String> keyStream = infinispanMap.keyStream();
 
-        fileMetadataMap.keys(keysResult -> {
-            if (keysResult.succeeded()) {
-                var keys = keysResult.result();
-                log.debug("Total keys in metadata map: {}", keys.size());
+            List<FileMetadata> allMetadata = Collections.synchronizedList(new ArrayList<>());
+            AtomicInteger pending = new AtomicInteger(0);
+            AtomicInteger keysProcessed = new AtomicInteger(0);
 
-                if (keys.isEmpty()) {
-                    log.debug("No files found, returning empty list");
-                    message.reply(new JsonObject().put(AppConstants.FIELD_FILES, new JsonArray())
-                            .put(AppConstants.FIELD_TOTAL, 0)
-                            .put(AppConstants.FIELD_PAGE, page)
-                            .put(AppConstants.FIELD_SIZE, finalSize));
-                    return;
-                }
+            keyStream.handler(key -> {
+                keysProcessed.incrementAndGet();
+                pending.incrementAndGet();
 
-                var allFiles = new JsonArray();
-                var pending = new AtomicInteger(keys.size());
-
-                keys.forEach(fileId ->
-                        fileMetadataMap.get(fileId, getResult -> {
-                            Optional.ofNullable(getResult.result())
-                                    .filter(metadata -> prefix.isEmpty() || metadata.fileName().startsWith(prefix))
-                                    .ifPresent(metadata -> allFiles.add(new JsonObject()
-                                            .put(AppConstants.FIELD_FILE_ID, metadata.fileId())
-                                            .put(AppConstants.FIELD_FILE_NAME, metadata.fileName())
-                                            .put(AppConstants.FIELD_CONTENT_TYPE, metadata.contentType())
-                                            .put(AppConstants.FIELD_SIZE, metadata.size())
-                                            .put(AppConstants.FIELD_CREATED_AT, metadata.createdAt().toString())));
-
-                            if (pending.decrementAndGet() == 0) {
-                                var sorted = new JsonArray();
-                                var list = new ArrayList<JsonObject>();
-                                for (int i = 0; i < allFiles.size(); i++) {
-                                    list.add((JsonObject) allFiles.getValue(i));
-                                }
-
-                                log.debug("Collected {} files matching prefix '{}'", list.size(), prefix);
-
-                                list.sort((a, b) -> {
-                                    int cmp = switch (sort) {
-                                        case AppConstants.FIELD_SIZE -> Long.compare(
-                                                a.getLong(AppConstants.FIELD_SIZE, 0L),
-                                                b.getLong(AppConstants.FIELD_SIZE, 0L));
-                                        case AppConstants.FIELD_DATE, AppConstants.FIELD_CREATED_AT ->
-                                                a.getString(AppConstants.FIELD_CREATED_AT, "")
-                                                        .compareTo(b.getString(AppConstants.FIELD_CREATED_AT, ""));
-                                        default -> a.getString(AppConstants.FIELD_FILE_NAME, "")
-                                                .compareTo(b.getString(AppConstants.FIELD_FILE_NAME, ""));
-                                    };
-                                    return asc ? cmp : -cmp;
-                                });
-
-                                int start = (page - 1) * finalSize;
-                                int end = Math.min(start + finalSize, list.size());
-                                for (int i = start; i < end; i++) {
-                                    sorted.add(list.get(i));
-                                }
-
-                                log.info("List request completed: page={}, size={}, total={}, returned={}",
-                                        page, finalSize, list.size(), sorted.size());
-
-                                message.reply(new JsonObject()
-                                        .put(AppConstants.FIELD_FILES, sorted)
-                                        .put(AppConstants.FIELD_PAGE, page)
-                                        .put(AppConstants.FIELD_SIZE, finalSize)
-                                        .put(AppConstants.FIELD_TOTAL, list.size()));
+                fileMetadataMap.get(key, getResult -> {
+                    try {
+                        if (getResult.succeeded() && getResult.result() != null) {
+                            FileMetadata meta = getResult.result();
+                            if (prefix.isEmpty() || meta.getFileName().startsWith(prefix)) {
+                                allMetadata.add(meta);
                             }
-                        })
-                );
-            } else {
-                log.error("Failed to list files: {}", keysResult.cause().getMessage());
+                        }
+                    } finally {
+                        if (pending.decrementAndGet() == 0) {
+                            processResults(allMetadata, page, finalSize, sort, asc, message);
+                        }
+                    }
+                });
+            });
+
+            keyStream.endHandler(v -> {
+                if (pending.get() == 0) {
+                    processResults(allMetadata, page, finalSize, sort, asc, message);
+                }
+                log.debug("Key stream completed, total keys: {}", keysProcessed.get());
+            });
+
+            keyStream.exceptionHandler(err -> {
+                log.error("Key stream failed", err);
                 message.fail(AppConstants.HTTP_INTERNAL_ERROR, AppConstants.ERR_LIST_FAILED);
-            }
+            });
+
+        } catch (Exception e) {
+            log.error("Failed to unwrap InfinispanAsyncMap", e);
+            message.fail(AppConstants.HTTP_INTERNAL_ERROR, AppConstants.ERR_LIST_FAILED);
+        }
+    }
+
+    private void processResults(List<FileMetadata> metadata, int page, int size, String sort, boolean asc, Message<Object> message) {
+        metadata.sort((a, b) -> {
+            int cmp = switch (sort) {
+                case "size" -> Long.compare(a.getSize(), b.getSize());
+                case "date", "createdAt" -> a.getCreatedAt().compareTo(b.getCreatedAt());
+                case "updatedAt" -> a.getUpdatedAt().compareTo(b.getUpdatedAt());
+                default -> a.getFileName().compareTo(b.getFileName());
+            };
+            return asc ? cmp : -cmp;
         });
+
+        int total = metadata.size();
+        int start = (page - 1) * size;
+        int end = Math.min(start + size, total);
+
+        JsonArray filesArray = new JsonArray();
+        for (int i = start; i < end; i++) {
+            FileMetadata m = metadata.get(i);
+            filesArray.add(new JsonObject()
+                    .put(AppConstants.FIELD_FILE_ID, m.getFileId())
+                    .put(AppConstants.FIELD_FILE_NAME, m.getFileName())
+                    .put(AppConstants.FIELD_CONTENT_TYPE, m.getContentType())
+                    .put(AppConstants.FIELD_SIZE, m.getSize())
+                    .put(AppConstants.FIELD_CREATED_AT, m.getCreatedAt().toString())
+                    .put(AppConstants.FIELD_UPDATED_AT, m.getUpdatedAt().toString()));
+        }
+
+        log.info("List completed: total={}, returned={}, page={}, size={}", total, filesArray.size(), page, size);
+
+        message.reply(new JsonObject()
+                .put(AppConstants.FIELD_FILES, filesArray)
+                .put(AppConstants.FIELD_PAGE, page)
+                .put(AppConstants.FIELD_SIZE, size)
+                .put(AppConstants.FIELD_TOTAL, total));
     }
 
     private void withFileLock(String fileId, RunnableWithCompletion action, Message<Object> message) {
@@ -470,5 +528,31 @@ public class FileProcessorVerticle extends AbstractVerticle {
                 onFailure.run();
             }
         });
+    }
+
+    private void syncToIndexedCache(String fileId, FileMetadata metadata) {
+        if (queryService != null) {
+            try {
+                ClusterManagerConfig.getCacheContainer()
+                        .getCache(FILE_METADATA_MAP_INDEXED)
+                        .put(fileId, metadata);
+                log.debug("Synced to indexed cache: fileId={}", fileId);
+            } catch (Exception e) {
+                log.warn("Failed to sync to indexed cache for fileId={}: {}", fileId, e.getMessage());
+            }
+        }
+    }
+
+    private void removeFromIndexedCache(String fileId) {
+        if (queryService != null) {
+            try {
+                ClusterManagerConfig.getCacheContainer()
+                        .getCache(FILE_METADATA_MAP_INDEXED)
+                        .remove(fileId);
+                log.debug("Removed from indexed cache: fileId={}", fileId);
+            } catch (Exception e) {
+                log.warn("Failed to remove from indexed cache for fileId={}: {}", fileId, e.getMessage());
+            }
+        }
     }
 }
