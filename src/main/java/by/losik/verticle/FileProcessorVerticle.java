@@ -6,7 +6,11 @@ import by.losik.config.EventBusConfig;
 import by.losik.constant.AppConstants;
 import by.losik.meta.FileMetadata;
 import by.losik.service.FileQueryService;
+import by.losik.volume.VolumeManager;
+import by.losik.volume.VolumeManagerFacade;
+import by.losik.volume.VolumeState;
 import io.vertx.core.AbstractVerticle;
+import io.vertx.core.Future;
 import io.vertx.core.Promise;
 import io.vertx.core.eventbus.Message;
 import io.vertx.core.json.JsonArray;
@@ -18,6 +22,7 @@ import io.vertx.ext.cluster.infinispan.InfinispanAsyncMap;
 import org.infinispan.Cache;
 import org.infinispan.manager.EmbeddedCacheManager;
 import org.jetbrains.annotations.NotNull;
+import org.jetbrains.annotations.Nullable;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -31,23 +36,36 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import java.util.Optional;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 
-public class FileProcessorVerticle extends AbstractVerticle {
+public class FileProcessorVerticle extends AbstractVerticle implements FileProcessor {
     private static final Logger log = LoggerFactory.getLogger(FileProcessorVerticle.class);
     private static final String FILE_METADATA_MAP = "file.metadata";
     private static final String FILE_METADATA_MAP_INDEXED = "file.metadata.indexed";
+
     private AsyncMap<String, FileMetadata> fileMetadataMap;
     private FileQueryService queryService;
-    private String nfsPath;
+    private VolumeManagerFacade volumeManager;
 
     @Override
     public void start(Promise<Void> startPromise) {
-        this.nfsPath = AppConfig.nfsPath();
-        log.info("Starting FileProcessorVerticle with NFS path: {}", nfsPath);
+        String nodeId = AppConfig.get().getString("node.id", "unknown");
 
-        vertx.fileSystem().mkdirsBlocking(nfsPath);
-        log.debug("NFS directory ensured at: {}", nfsPath);
+        volumeManager = new VolumeManager(vertx, nodeId);
+
+        log.info("Starting FileProcessorVerticle with {} volumes", volumeManager.getVolumes().size());
+        log.info("Volume strategy: {}", volumeManager.getStrategy().getName());
+
+        for (String volumePath : volumeManager.getVolumes().keySet()) {
+            vertx.fileSystem().mkdirs(volumePath, mkdir -> {
+                if (mkdir.succeeded()) {
+                    log.debug("Volume directory ensured: {}", volumePath);
+                } else {
+                    log.warn("Failed to ensure volume directory: {}", volumePath, mkdir.cause());
+                }
+            });
+        }
 
         if (AppConfig.isClustered()) {
             vertx.sharedData().<String, FileMetadata>getClusterWideMap(FILE_METADATA_MAP, ar -> {
@@ -55,12 +73,9 @@ public class FileProcessorVerticle extends AbstractVerticle {
                     fileMetadataMap = ar.result();
                     initQueryService();
                     setupEventBusConsumer();
-                    restoreAllMetadataFromNfs(startPromise);
-                    startPromise.complete();
-                    log.info("FileProcessorVerticle started successfully");
-                    log.warn("The server is launched in clustered mode");
+                    restoreAllMetadataFromNfs(Promise.promise());
                 } else {
-                    log.error("Failed to initialize file metadata map: {}", ar.cause().getMessage(), ar.cause());
+                    log.error("Failed to initialize file metadata map", ar.cause());
                     startPromise.fail(ar.cause());
                 }
             });
@@ -69,11 +84,10 @@ public class FileProcessorVerticle extends AbstractVerticle {
                 if (ar.succeeded()) {
                     fileMetadataMap = ar.result();
                     setupEventBusConsumer();
-                    startPromise.complete();
-                    log.info("FileProcessorVerticle started successfully");
-                    log.warn("The server is launched in non-clustered mode");
+                    startPromise.tryComplete();
+                    log.info("FileProcessorVerticle started in non-clustered mode");
                 } else {
-                    log.error("Failed to initialize file metadata map: {}", ar.cause().getMessage(), ar.cause());
+                    log.error("Failed to initialize file metadata map", ar.cause());
                     startPromise.fail(ar.cause());
                 }
             });
@@ -81,39 +95,80 @@ public class FileProcessorVerticle extends AbstractVerticle {
     }
 
     private void restoreAllMetadataFromNfs(Promise<Void> startPromise) {
-        log.info("Restoring metadata from NFS directory: {}", nfsPath);
+        List<String> volumes = new ArrayList<>(volumeManager.getVolumes().keySet());
 
-        vertx.executeBlocking(promise -> {
+        if (volumes.isEmpty()) {
+            log.warn("No volumes configured, nothing to restore");
+            startPromise.tryComplete();
+            return;
+        }
+
+        vertx.sharedData().getLockWithTimeout("metadata-restore-lock", 60000, lockResult -> {
+            if (lockResult.failed()) {
+                log.info("Another node/instance is already restoring metadata, skipping");
+                startPromise.tryComplete();
+                return;
+            }
+
+            Lock lock = lockResult.result();
+            log.info("Acquired restore lock, starting metadata restoration from {} volumes", volumes.size());
+
+            AtomicInteger totalFiles = new AtomicInteger(0);
+            AtomicInteger restored = new AtomicInteger(0);
+            AtomicInteger failed = new AtomicInteger(0);
+            AtomicInteger completedVolumes = new AtomicInteger(0);
+
+            for (String volumePath : volumes) {
+                scanVolumeAndRestore(volumePath, restored, failed, totalFiles)
+                        .onComplete(v -> {
+                            int completed = completedVolumes.incrementAndGet();
+                            if (completed == volumes.size()) {
+                                log.info("Metadata restoration completed: restored={}, failed={}, total={}",
+                                        restored.get(), failed.get(), totalFiles.get());
+                                lock.release();
+                                startPromise.tryComplete();
+                            }
+                        });
+            }
+        });
+    }
+
+    @Override
+    public Future<Void> scanVolumeAndRestore(String volumePath, AtomicInteger restored,
+                                             AtomicInteger failed, AtomicInteger totalFiles) {
+        Promise<Void> promise = Promise.promise();
+
+        vertx.executeBlocking(p -> {
             List<Path> files = new ArrayList<>();
-            try (DirectoryStream<Path> stream = Files.newDirectoryStream(Path.of(nfsPath))) {
+            try (DirectoryStream<Path> stream = Files.newDirectoryStream(Path.of(volumePath))) {
                 for (Path path : stream) {
                     files.add(path);
                 }
             } catch (IOException e) {
-                promise.fail(e);
+                p.fail(e);
                 return;
             }
-            promise.complete(files);
+            p.complete(files);
         }, asyncResult -> {
             if (asyncResult.failed()) {
-                log.error("Failed to scan NFS directory", asyncResult.cause());
-                startPromise.fail(asyncResult.cause());
+                log.error("Failed to scan volume: {}", volumePath, asyncResult.cause());
+                promise.fail(asyncResult.cause());
                 return;
             }
 
             @SuppressWarnings("unchecked")
             List<Path> files = (List<Path>) asyncResult.result();
+            totalFiles.addAndGet(files.size());
 
             if (files.isEmpty()) {
-                log.info("No existing files found in NFS directory");
-                startPromise.complete();
+                log.info("No files found in volume: {}", volumePath);
+                promise.complete();
                 return;
             }
 
-            log.info("Found {} files in NFS directory, restoring metadata", files.size());
+            log.info("Found {} files in volume: {}", files.size(), volumePath);
 
-            AtomicInteger restored = new AtomicInteger(0);
-            AtomicInteger failed = new AtomicInteger(0);
+            AtomicInteger processed = new AtomicInteger(0);
             int total = files.size();
 
             for (Path path : files) {
@@ -121,8 +176,11 @@ public class FileProcessorVerticle extends AbstractVerticle {
                 int underscoreIndex = fileName.indexOf('_');
 
                 if (underscoreIndex <= 0) {
-                    log.warn("Skipping invalid file name format: {}", fileName);
-                    checkRestoreCompletion(total, restored.incrementAndGet(), failed.get(), startPromise);
+                    log.warn("Skipping invalid file name format: {} in volume {}", fileName, volumePath);
+                    restored.incrementAndGet();
+                    if (processed.incrementAndGet() == total) {
+                        promise.complete();
+                    }
                     continue;
                 }
 
@@ -131,54 +189,63 @@ public class FileProcessorVerticle extends AbstractVerticle {
 
                 fileMetadataMap.get(fileId, getResult -> {
                     if (getResult.succeeded() && getResult.result() != null) {
-                        checkRestoreCompletion(total, restored.incrementAndGet(), failed.get(), startPromise);
-                    } else {
-                        try {
-                            FileTime lastModified = Files.getLastModifiedTime(path);
-                            Instant updatedAt = lastModified.toInstant();
+                        restored.incrementAndGet();
+                        if (processed.incrementAndGet() == total) {
+                            promise.complete();
+                        }
+                        return;
+                    }
 
-                            Instant createdAt;
-                            try {
-                                FileTime creationTime = (FileTime) Files.getAttribute(path, "creationTime");
-                                createdAt = creationTime != null ? creationTime.toInstant() : updatedAt;
-                            } catch (Exception e) {
-                                createdAt = updatedAt;
+                    try {
+                        FileTime lastModified = Files.getLastModifiedTime(path);
+                        Instant updatedAt = lastModified.toInstant();
+                        Instant createdAt = getCreationTime(path, updatedAt);
+
+                        String contentType = Files.probeContentType(path);
+                        if (contentType == null) {
+                            contentType = "application/octet-stream";
+                        }
+
+                        FileMetadata metadata = new FileMetadata(
+                                fileId, actualFileName, path.toString(), contentType,
+                                Files.size(path), createdAt, updatedAt
+                        );
+
+                        fileMetadataMap.put(fileId, metadata, putResult -> {
+                            if (putResult.succeeded()) {
+                                syncToIndexedCache(fileId, metadata);
+                                restored.incrementAndGet();
+                                volumeManager.incrementFileCount(volumePath);
+                                log.debug("Restored metadata for fileId={} on volume {}", fileId, volumePath);
+                            } else {
+                                log.error("Failed to restore metadata for fileId={}", fileId, putResult.cause());
+                                failed.incrementAndGet();
                             }
 
-                            String contentType = Files.probeContentType(path);
-                            if (contentType == null) {
-                                contentType = "application/octet-stream";
+                            if (processed.incrementAndGet() == total) {
+                                promise.complete();
                             }
-
-                            FileMetadata metadata = new FileMetadata(
-                                    fileId, actualFileName, path.toString(), contentType,
-                                    Files.size(path), createdAt, updatedAt
-                            );
-
-                            fileMetadataMap.put(fileId, metadata, putResult -> {
-                                if (putResult.succeeded()) {
-                                    syncToIndexedCache(fileId, metadata);
-                                    log.debug("Restored metadata for fileId={}", fileId);
-                                    checkRestoreCompletion(total, restored.incrementAndGet(), failed.get(), startPromise);
-                                } else {
-                                    log.error("Failed to put metadata for fileId={}", fileId, putResult.cause());
-                                    checkRestoreCompletion(total, restored.get(), failed.incrementAndGet(), startPromise);
-                                }
-                            });
-                        } catch (IOException e) {
-                            log.error("Failed to read file: {}", path, e);
-                            checkRestoreCompletion(total, restored.get(), failed.incrementAndGet(), startPromise);
+                        });
+                    } catch (IOException e) {
+                        log.error("Failed to read file: {}", path, e);
+                        failed.incrementAndGet();
+                        if (processed.incrementAndGet() == total) {
+                            promise.complete();
                         }
                     }
                 });
             }
         });
+
+        return promise.future();
     }
 
-    private void checkRestoreCompletion(int total, int restored, int failed, Promise<Void> startPromise) {
-        if (restored + failed >= total) {
-            log.info("Metadata restoration completed: restored={}, failed={}, total={}", restored, failed, total);
-            startPromise.complete();
+    private Instant getCreationTime(Path path, Instant fallback) {
+        try {
+            FileTime creationTime = (FileTime) Files.getAttribute(path, "creationTime");
+            return creationTime != null ? creationTime.toInstant() : fallback;
+        } catch (Exception e) {
+            return fallback;
         }
     }
 
@@ -201,30 +268,20 @@ public class FileProcessorVerticle extends AbstractVerticle {
         EventBusConfig.eventBus().consumer(EventBusConfig.FILE_LIST_ADDRESS, this::handleRequest);
         EventBusConfig.eventBus().consumer(EventBusConfig.FILE_UPDATE_ADDRESS, this::handleRequest);
         EventBusConfig.eventBus().consumer(EventBusConfig.FILE_DOWNLOAD_ADDRESS, this::handleRequest);
-        log.info("EventBus consumers registered for addresses: {}, {}, {}, {}, {}, {}",
-                EventBusConfig.FILE_UPLOAD_ADDRESS,
-                EventBusConfig.FILE_GET_ADDRESS,
-                EventBusConfig.FILE_DELETE_ADDRESS,
-                EventBusConfig.FILE_LIST_ADDRESS,
-                EventBusConfig.FILE_UPDATE_ADDRESS,
-                EventBusConfig.FILE_DOWNLOAD_ADDRESS);
+        log.info("EventBus consumers registered");
     }
 
-    private void handleRequest(@NotNull Message<Object> message) {
+    @Override
+    public void handleRequest(@NotNull Message<Object> message) {
         JsonObject msg = (JsonObject) message.body();
         String action = msg.getString(AppConstants.FIELD_ACTION);
-
-        log.debug("Received request with action: {}, reply address: {}", action, message.replyAddress());
 
         Optional.ofNullable(action)
                 .map(this::resolveAction)
                 .ifPresentOrElse(
-                        handler -> {
-                            log.debug("Dispatching action '{}' to handler", action);
-                            handler.handle(msg, message);
-                        },
+                        handler -> handler.handle(msg, message),
                         () -> {
-                            log.warn("Unknown action received: {}, from: {}", action, message.replyAddress());
+                            log.warn("Unknown action: {}", action);
                             message.fail(AppConstants.HTTP_BAD_REQUEST, AppConstants.ERR_UNKNOWN_ACTION);
                         }
                 );
@@ -242,14 +299,27 @@ public class FileProcessorVerticle extends AbstractVerticle {
         };
     }
 
-    private void handleUpload(@NotNull JsonObject msg, Message<Object> message) {
+    @Override
+    public void handleUpload(@NotNull JsonObject msg, Message<Object> message) {
         String fileId = msg.getString(AppConstants.FIELD_FILE_ID);
         String fileName = msg.getString(AppConstants.FIELD_FILE_NAME);
         String tempPath = msg.getString(AppConstants.FIELD_FILE_PATH);
-        String targetPath = nfsPath + "/" + fileId + "_" + fileName;
         String contentType = msg.getString(AppConstants.FIELD_CONTENT_TYPE);
 
-        log.info("Handling upload: fileId={}, fileName={}, tempPath={}", fileId, fileName, tempPath);
+        if (fileName == null || fileName.isBlank()) {
+            log.error("Upload rejected: fileName is null or blank for fileId={}", fileId);
+            message.fail(AppConstants.HTTP_BAD_REQUEST, "fileName is required");
+            return;
+        }
+
+        FileMetadata tempMetadata = new FileMetadata(
+                fileId, fileName, "", contentType, 0, Instant.now(), Instant.now()
+        );
+
+        String selectedVolume = volumeManager.selectVolume(tempMetadata);
+        String targetPath = selectedVolume + "/" + fileId + "_" + fileName;
+
+        log.info("Handling upload: fileId={}, fileName={}, targetVolume={}", fileId, fileName, selectedVolume);
 
         withFileLock(fileId, (metadataMap, releaseLock) ->
                 metadataMap.get(fileId, getResult -> {
@@ -261,130 +331,44 @@ public class FileProcessorVerticle extends AbstractVerticle {
                     }
 
                     vertx.fileSystem().props(tempPath, propsResult -> {
-                        long size = propsResult.succeeded() ? propsResult.result().size() : 0;
+                        if (propsResult.failed()) {
+                            log.error("Failed to get props for temp file: {}", tempPath, propsResult.cause());
+                            releaseLock.run();
+                            message.fail(AppConstants.HTTP_INTERNAL_ERROR, "Failed to read uploaded file");
+                            return;
+                        }
+
+                        long size = propsResult.result().size();
                         Instant now = Instant.now();
 
-                        log.debug("File properties - size: {} bytes, tempPath: {}", size, tempPath);
-
-                        var metadata = new FileMetadata(
-                                fileId, fileName, targetPath, contentType,
-                                size, now, now
+                        FileMetadata metadata = new FileMetadata(
+                                fileId, fileName, targetPath, contentType, size, now, now
                         );
 
                         vertx.fileSystem().copy(tempPath, targetPath, copyResult -> {
-                            if (copyResult.succeeded()) {
-                                log.debug("File copied successfully from {} to {}", tempPath, targetPath);
-                                metadataMap.put(fileId, metadata, putResult -> {
-                                    vertx.fileSystem().delete(tempPath)
-                                            .onFailure(err -> log.warn("Temp file cleanup failed: {}", tempPath, err));
-
-                                    if (putResult.succeeded()) {
-                                        syncToIndexedCache(fileId, metadata);
-
-                                        vertx.fileSystem().delete(tempPath, deleteResult -> {
-                                            if (deleteResult.failed()) {
-                                                log.error("Failed to delete temp file: {}, error: {}", tempPath, deleteResult.cause().getMessage());
-                                            } else {
-                                                log.debug("Temp file deleted: {}", tempPath);
-                                            }
-                                        });
-                                        releaseLock.run();
-                                        log.info("Upload completed successfully: fileId={}, fileName={}, size={}", fileId, fileName, size);
-                                        message.reply(new JsonObject().put(AppConstants.FIELD_STATUS, AppConstants.STATUS_OK));
-                                    } else {
-                                        log.error("Failed to save metadata for fileId={}: {}", fileId, putResult.cause().getMessage());
-                                        deleteFileOnly(targetPath,
-                                                () -> {
-                                                    releaseLock.run();
-                                                    message.fail(AppConstants.HTTP_INTERNAL_ERROR, AppConstants.ERR_SAVE_METADATA);
-                                                },
-                                                () -> {
-                                                    log.error("Cleanup failed for targetPath: {}", targetPath);
-                                                    releaseLock.run();
-                                                    message.fail(AppConstants.HTTP_INTERNAL_ERROR, AppConstants.ERR_SAVE_METADATA + " and cleanup failed");
-                                                }
-                                        );
-                                    }
-                                });
-                            } else {
-                                log.error("Failed to copy file to NFS from {} to {}: {}", tempPath, targetPath, copyResult.cause().getMessage());
+                            if (copyResult.failed()) {
+                                log.error("Failed to copy file to {}", targetPath, copyResult.cause());
                                 releaseLock.run();
                                 message.fail(AppConstants.HTTP_INTERNAL_ERROR, AppConstants.ERR_COPY_TO_NFS);
-                            }
-                        });
-                    });
-                }), message);
-    }
-
-    private void handleUpdate(@NotNull JsonObject msg, Message<Object> message) {
-        String fileId = msg.getString(AppConstants.FIELD_FILE_ID);
-        String fileName = msg.getString(AppConstants.FIELD_FILE_NAME);
-        String tempPath = msg.getString(AppConstants.FIELD_FILE_PATH);
-        String targetPath = nfsPath + "/" + fileId + "_" + fileName;
-        String contentType = msg.getString(AppConstants.FIELD_CONTENT_TYPE);
-
-        log.info("Handling update: fileId={}, newFileName={}, tempPath={}", fileId, fileName, tempPath);
-
-        withFileLock(fileId, (metadataMap, releaseLock) ->
-                metadataMap.get(fileId, getResult -> {
-                    if (getResult.failed() || getResult.result() == null) {
-                        log.warn("Update failed - file not found: fileId={}", fileId);
-                        releaseLock.run();
-                        message.fail(AppConstants.HTTP_NOT_FOUND, AppConstants.ERR_FILE_NOT_FOUND);
-                        return;
-                    }
-
-                    FileMetadata oldMetadata = getResult.result();
-                    log.debug("Found existing file: fileId={}, oldPath={}", fileId, oldMetadata.getFilePath());
-
-                    vertx.fileSystem().props(tempPath, propsResult -> {
-                        long size = propsResult.succeeded() ? propsResult.result().size() : 0;
-                        Instant now = Instant.now();
-
-                        var newMetadata = new FileMetadata(
-                                fileId, fileName, targetPath, contentType,
-                                size, oldMetadata.getCreatedAt(), now
-                        );
-
-                        vertx.fileSystem().delete(oldMetadata.getFilePath(), deleteResult -> {
-                            if (deleteResult.failed()) {
-                                log.warn("Failed to delete old file {}: {}", oldMetadata.getFilePath(), deleteResult.cause().getMessage());
-                            } else {
-                                log.debug("Old file deleted: {}", oldMetadata.getFilePath());
+                                return;
                             }
 
-                            vertx.fileSystem().copy(tempPath, targetPath, copyResult -> {
-                                if (copyResult.succeeded()) {
-                                    log.debug("New file copied to: {}", targetPath);
-                                    metadataMap.put(fileId, newMetadata, putResult -> {
-                                        vertx.fileSystem().delete(tempPath)
-                                                .onFailure(err -> log.warn("Temp file cleanup failed: {}", tempPath, err));
+                            metadataMap.put(fileId, metadata, putResult -> {
+                                vertx.fileSystem().delete(tempPath)
+                                        .onFailure(err -> log.warn("Temp cleanup failed: {}", tempPath, err));
 
-                                        if (putResult.succeeded()) {
-                                            syncToIndexedCache(fileId, newMetadata);
-
-                                            releaseLock.run();
-                                            log.info("Update completed successfully: fileId={}, newFileName={}, size={}", fileId, fileName, size);
-                                            message.reply(new JsonObject().put(AppConstants.FIELD_STATUS, AppConstants.STATUS_UPDATED));
-                                        } else {
-                                            log.error("Failed to update metadata for fileId={}: {}", fileId, putResult.cause().getMessage());
-                                            deleteFileOnly(targetPath,
-                                                    () -> {
-                                                        releaseLock.run();
-                                                        message.fail(AppConstants.HTTP_INTERNAL_ERROR, AppConstants.ERR_SAVE_METADATA);
-                                                    },
-                                                    () -> {
-                                                        log.error("Cleanup failed for targetPath: {}", targetPath);
-                                                        releaseLock.run();
-                                                        message.fail(AppConstants.HTTP_INTERNAL_ERROR, AppConstants.ERR_SAVE_METADATA + " and cleanup failed");
-                                                    }
-                                            );
-                                        }
-                                    });
-                                } else {
-                                    log.error("Failed to copy file for update from {} to {}: {}", tempPath, targetPath, copyResult.cause().getMessage());
+                                if (putResult.succeeded()) {
+                                    syncToIndexedCache(fileId, metadata);
+                                    volumeManager.incrementFileCount(selectedVolume);
                                     releaseLock.run();
-                                    message.fail(AppConstants.HTTP_INTERNAL_ERROR, AppConstants.ERR_COPY_TO_NFS);
+                                    log.info("Upload completed: fileId={}, size={}", fileId, size);
+                                    message.reply(new JsonObject().put(AppConstants.FIELD_STATUS, AppConstants.STATUS_OK));
+                                } else {
+                                    log.error("Failed to save metadata for {}", fileId, putResult.cause());
+                                    vertx.fileSystem().delete(targetPath)
+                                            .onFailure(deleteErr -> log.warn("Failed to cleanup target file"));
+                                    releaseLock.run();
+                                    message.fail(AppConstants.HTTP_INTERNAL_ERROR, AppConstants.ERR_SAVE_METADATA);
                                 }
                             });
                         });
@@ -392,7 +376,131 @@ public class FileProcessorVerticle extends AbstractVerticle {
                 }), message);
     }
 
-    private void handleDelete(@NotNull JsonObject msg, Message<Object> message) {
+    @Override
+    public void handleUpdate(@NotNull JsonObject msg, Message<Object> message) {
+        String fileId = msg.getString(AppConstants.FIELD_FILE_ID);
+        String fileName = msg.getString(AppConstants.FIELD_FILE_NAME);
+        String tempPath = msg.getString(AppConstants.FIELD_FILE_PATH);
+        String contentType = msg.getString(AppConstants.FIELD_CONTENT_TYPE);
+        boolean skipFileCopy = msg.getBoolean("skipFileCopy", false);
+        Long providedSize = msg.getLong("size");
+
+        if (fileName == null || fileName.isBlank()) {
+            log.error("Update rejected: fileName is null or blank for fileId={}", fileId);
+            message.fail(AppConstants.HTTP_BAD_REQUEST, "fileName is required for update");
+            return;
+        }
+
+        log.info("Update: fileId={}, newFileName={}, skipFileCopy={}", fileId, fileName, skipFileCopy);
+
+        withFileLock(fileId, (map, releaseLock) ->
+                map.get(fileId, getResult -> {
+                    if (getResult.failed() || getResult.result() == null) {
+                        releaseLock.run();
+                        message.fail(AppConstants.HTTP_NOT_FOUND, AppConstants.ERR_FILE_NOT_FOUND);
+                        return;
+                    }
+
+                    FileMetadata oldMetadata = getResult.result();
+                    String oldVolume = extractVolumeFromPath(oldMetadata.getFilePath());
+                    Instant now = Instant.now();
+
+                    if (skipFileCopy) {
+                        long size = providedSize != null ? providedSize : oldMetadata.getSize();
+                        String targetPath = tempPath != null ? tempPath : oldMetadata.getFilePath();
+
+                        FileMetadata newMetadata = new FileMetadata(
+                                fileId, fileName, targetPath, contentType,
+                                size, oldMetadata.getCreatedAt(), now
+                        );
+
+                        map.put(fileId, newMetadata, putResult -> {
+                            try {
+                                if (putResult.succeeded()) {
+                                    syncToIndexedCache(fileId, newMetadata);
+                                    if (!targetPath.equals(oldMetadata.getFilePath())) {
+                                        volumeManager.decrementFileCount(oldVolume);
+                                        String newVolume = extractVolumeFromPath(targetPath);
+                                        if (newVolume != null) {
+                                            volumeManager.incrementFileCount(newVolume);
+                                        }
+                                    }
+                                    log.info("Metadata update completed for fileId={}", fileId);
+                                    message.reply(new JsonObject().put(AppConstants.FIELD_STATUS, AppConstants.STATUS_UPDATED));
+                                } else {
+                                    log.error("Failed to save metadata for {}", fileId, putResult.cause());
+                                    message.fail(AppConstants.HTTP_INTERNAL_ERROR, AppConstants.ERR_SAVE_METADATA);
+                                }
+                            } finally {
+                                releaseLock.run();
+                            }
+                        });
+                        return;
+                    }
+
+                    if (tempPath == null || tempPath.isBlank()) {
+                        log.error("Update rejected: tempPath is null or blank for fileId={}", fileId);
+                        releaseLock.run();
+                        message.fail(AppConstants.HTTP_BAD_REQUEST, "file data is required for update");
+                        return;
+                    }
+
+                    String selectedVolume = volumeManager.selectVolume(oldMetadata);
+                    String targetPath = selectedVolume + "/" + fileId + "_" + fileName;
+
+                    vertx.fileSystem().props(tempPath, propsResult -> {
+                        if (propsResult.failed()) {
+                            log.error("Failed to get props for temp file: {}", tempPath, propsResult.cause());
+                            releaseLock.run();
+                            message.fail(AppConstants.HTTP_INTERNAL_ERROR, "Failed to read uploaded file");
+                            return;
+                        }
+
+                        long size = propsResult.result().size();
+
+                        FileMetadata newMetadata = new FileMetadata(
+                                fileId, fileName, targetPath, contentType,
+                                size, oldMetadata.getCreatedAt(), now
+                        );
+
+                        vertx.fileSystem().delete(oldMetadata.getFilePath(), deleteResult -> {
+                            if (deleteResult.failed()) {
+                                log.warn("Failed to delete old file: {}, continuing anyway", oldMetadata.getFilePath(), deleteResult.cause());
+                            }
+
+                            vertx.fileSystem().copy(tempPath, targetPath, copyResult -> {
+                                if (copyResult.failed()) {
+                                    log.error("Failed to copy file to {}", targetPath, copyResult.cause());
+                                    releaseLock.run();
+                                    message.fail(AppConstants.HTTP_INTERNAL_ERROR, AppConstants.ERR_COPY_TO_NFS);
+                                    return;
+                                }
+
+                                map.put(fileId, newMetadata, putResult -> {
+                                    vertx.fileSystem().delete(tempPath)
+                                            .onFailure(err -> log.warn("Temp cleanup failed: {}", tempPath, err));
+
+                                    syncToIndexedCache(fileId, newMetadata);
+                                    volumeManager.decrementFileCount(oldVolume);
+                                    volumeManager.incrementFileCount(selectedVolume);
+                                    releaseLock.run();
+
+                                    if (putResult.succeeded()) {
+                                        log.info("Update completed: fileId={}", fileId);
+                                        message.reply(new JsonObject().put(AppConstants.FIELD_STATUS, AppConstants.STATUS_UPDATED));
+                                    } else {
+                                        log.error("Failed to save metadata for {}", fileId, putResult.cause());
+                                        message.fail(AppConstants.HTTP_INTERNAL_ERROR, AppConstants.ERR_SAVE_METADATA);
+                                    }
+                                });
+                            });
+                        });
+                    });
+                }), message);
+    }
+
+    @Override
+    public void handleDelete(@NotNull JsonObject msg, Message<Object> message) {
         String fileId = msg.getString(AppConstants.FIELD_FILE_ID);
         log.info("Handling delete: fileId={}", fileId);
 
@@ -401,136 +509,117 @@ public class FileProcessorVerticle extends AbstractVerticle {
                     if (removeResult.succeeded()) {
                         FileMetadata metadata = removeResult.result();
                         if (metadata != null) {
-                            log.debug("Metadata removed for fileId={}, path={}", fileId, metadata.getFilePath());
+                            String volumePath = extractVolumeFromPath(metadata.getFilePath());
 
                             removeFromIndexedCache(fileId);
-
                             vertx.fileSystem().delete(metadata.getFilePath(), deleteResult -> {
+                                volumeManager.decrementFileCount(volumePath);
                                 releaseLock.run();
                                 if (deleteResult.succeeded()) {
-                                    log.info("Delete completed successfully: fileId={}", fileId);
+                                    log.info("Delete completed: fileId={}", fileId);
                                     message.reply(new JsonObject().put(AppConstants.FIELD_STATUS, AppConstants.STATUS_DELETED));
                                 } else {
-                                    log.warn("File deleted but physical file may remain: fileId={}, path={}, error={}",
-                                            fileId, metadata.getFilePath(), deleteResult.cause().getMessage());
+                                    log.warn("File deleted but physical file may remain: {}", fileId);
                                     message.reply(new JsonObject().put(AppConstants.FIELD_STATUS, AppConstants.STATUS_DELETED_BUT_FILE_MAY_REMAIN));
                                 }
                             });
                         } else {
-                            log.warn("Delete failed - file not found: fileId={}", fileId);
                             releaseLock.run();
                             message.fail(AppConstants.HTTP_NOT_FOUND, AppConstants.ERR_FILE_NOT_FOUND);
                         }
                     } else {
-                        log.error("Failed to remove metadata for fileId={}: {}", fileId, removeResult.cause().getMessage());
                         releaseLock.run();
                         message.fail(AppConstants.HTTP_INTERNAL_ERROR, AppConstants.ERR_REMOVE_METADATA);
                     }
                 }), message);
     }
 
-    private void handleGet(@NotNull JsonObject msg, Message<Object> message) {
+    @Override
+    public void handleGet(@NotNull JsonObject msg, Message<Object> message) {
         String fileId = msg.getString(AppConstants.FIELD_FILE_ID);
-        log.debug("Handling get metadata: fileId={}", fileId);
+        log.debug("Get metadata: fileId={}", fileId);
 
         fileMetadataMap.get(fileId, getResult -> {
             if (getResult.succeeded() && getResult.result() != null) {
-                log.info("GET: Found in cache: fileId={}", fileId);
-                message.reply(new JsonObject()
-                        .put(AppConstants.FIELD_FILE_ID, getResult.result().getFileId())
-                        .put(AppConstants.FIELD_FILE_NAME, getResult.result().getFileName())
-                        .put(AppConstants.FIELD_CONTENT_TYPE, getResult.result().getContentType())
-                        .put(AppConstants.FIELD_FILE_PATH, getResult.result().getFilePath())
-                        .put(AppConstants.FIELD_CREATED_AT, getResult.result().getCreatedAt().toString())
-                        .put(AppConstants.FIELD_UPDATED_AT, getResult.result().getUpdatedAt().toString()));
+                message.reply(metadataToJson(getResult.result()));
             } else {
-                log.info("GET: Not in cache, attempting to restore from NFS: fileId={}", fileId);
-
-                vertx.executeBlocking(promise -> {
-                    String nfsPathStr = nfsPath;
-                    log.debug("Scanning NFS directory: {} for pattern: {}_*", nfsPathStr, fileId);
-
-                    Path nfsDir = Path.of(nfsPathStr);
-                    log.debug("NFS directory exists: {}", Files.exists(nfsDir));
-
-                    try (DirectoryStream<Path> stream = Files.newDirectoryStream(nfsDir)) {
-                        List<String> allFiles = new ArrayList<>();
-                        Path found = null;
-
-                        for (Path path : stream) {
-                            String fileName = path.getFileName().toString();
-                            allFiles.add(fileName);
-
-                            if (fileName.startsWith(fileId + "_")) {
-                                found = path;
-                                log.info("Found matching file: {}", fileName);
-                                break;
-                            }
-                        }
-
-                        if (found == null) {
-                            log.warn("No file found starting with: {}_", fileId);
-                            log.debug("All files in directory: {}", allFiles);
-                        }
-
-                        promise.complete(found);
-                    } catch (IOException e) {
-                        log.error("Error scanning NFS directory: {}", nfsPathStr, e);
-                        promise.fail(e);
-                    }
-                }, asyncResult -> {
-                    if (asyncResult.succeeded() && asyncResult.result() != null) {
-                        Path filePath = (Path) asyncResult.result();
-                        String fullFileName = filePath.getFileName().toString();
-                        int underscoreIndex = fullFileName.indexOf('_');
-                        String fileName = underscoreIndex > 0 ?
-                                fullFileName.substring(underscoreIndex + 1) : fullFileName;
-
-                        log.info("Restoring metadata for fileId={}, fileName={}, path={}",
-                                fileId, fileName, filePath);
-
-                        vertx.fileSystem().props(filePath.toString(), propsResult -> {
-                            if (propsResult.succeeded()) {
-                                Instant now = Instant.now();
-                                FileMetadata newMetadata = new FileMetadata(
-                                        fileId, fileName, filePath.toString(), "application/octet-stream",
-                                        propsResult.result().size(), now, now
-                                );
-
-                                fileMetadataMap.put(fileId, newMetadata, putResult -> {
-                                    if (putResult.succeeded()) {
-                                        log.info("Successfully restored and cached metadata for fileId={}", fileId);
-                                        syncToIndexedCache(fileId, newMetadata);
-                                        message.reply(new JsonObject()
-                                                .put(AppConstants.FIELD_FILE_ID, newMetadata.getFileId())
-                                                .put(AppConstants.FIELD_FILE_NAME, newMetadata.getFileName())
-                                                .put(AppConstants.FIELD_CONTENT_TYPE, newMetadata.getContentType())
-                                                .put(AppConstants.FIELD_FILE_PATH, newMetadata.getFilePath())
-                                                .put(AppConstants.FIELD_CREATED_AT, newMetadata.getCreatedAt().toString())
-                                                .put(AppConstants.FIELD_UPDATED_AT, newMetadata.getUpdatedAt().toString()));
-                                    } else {
-                                        log.error("Failed to cache restored metadata for fileId={}", fileId, putResult.cause());
-                                        message.fail(AppConstants.HTTP_INTERNAL_ERROR, "Failed to cache restored metadata");
-                                    }
-                                });
-                            } else {
-                                log.error("Failed to get file properties for restored file: {}", filePath);
-                                message.fail(AppConstants.HTTP_NOT_FOUND, AppConstants.ERR_FILE_NOT_FOUND);
-                            }
-                        });
-                    } else {
-                        log.warn("File not found in NFS for fileId={}", fileId);
-                        if (asyncResult.cause() != null) {
-                            log.warn("Error cause: {}", asyncResult.cause().getMessage());
-                        }
-                        message.fail(AppConstants.HTTP_NOT_FOUND, AppConstants.ERR_FILE_NOT_FOUND);
-                    }
-                });
+                restoreFileFromVolumes(fileId, message);
             }
         });
     }
 
-    private void handleList(@NotNull JsonObject msg, Message<Object> message) {
+    private void restoreFileFromVolumes(String fileId, Message<Object> message) {
+        List<String> volumes = new ArrayList<>(volumeManager.getVolumes().keySet());
+        log.debug("Searching for file {} across {} volumes", fileId, volumes.size());
+
+        findFileInVolumes(fileId, volumes, 0, message);
+    }
+
+    private void findFileInVolumes(String fileId, @NotNull List<String> volumes, int index, Message<Object> message) {
+        if (index >= volumes.size()) {
+            message.fail(AppConstants.HTTP_NOT_FOUND, AppConstants.ERR_FILE_NOT_FOUND);
+            return;
+        }
+
+        String volumePath = volumes.get(index);
+
+        vertx.executeBlocking(promise -> {
+            Path found = null;
+            try (DirectoryStream<Path> stream = Files.newDirectoryStream(Path.of(volumePath))) {
+                for (Path path : stream) {
+                    if (path.getFileName().toString().startsWith(fileId + "_")) {
+                        found = path;
+                        break;
+                    }
+                }
+            } catch (IOException e) {
+                promise.fail(e);
+                return;
+            }
+            promise.complete(found);
+        }, asyncResult -> {
+            if (asyncResult.succeeded() && asyncResult.result() != null) {
+                Path filePath = (Path) asyncResult.result();
+                restoreAndCacheMetadata(fileId, filePath, message);
+            } else {
+                findFileInVolumes(fileId, volumes, index + 1, message);
+            }
+        });
+    }
+
+    private void restoreAndCacheMetadata(String fileId, @NotNull Path filePath, Message<Object> message) {
+        String fullFileName = filePath.getFileName().toString();
+        int underscoreIndex = fullFileName.indexOf('_');
+        String fileName = underscoreIndex > 0 ? fullFileName.substring(underscoreIndex + 1) : fullFileName;
+
+        vertx.fileSystem().props(filePath.toString(), propsResult -> {
+            if (propsResult.succeeded()) {
+                Instant now = Instant.now();
+                FileMetadata metadata = new FileMetadata(
+                        fileId, fileName, filePath.toString(), "application/octet-stream",
+                        propsResult.result().size(), now, now
+                );
+
+                fileMetadataMap.put(fileId, metadata, putResult -> {
+                    if (putResult.succeeded()) {
+                        syncToIndexedCache(fileId, metadata);
+                        String volume = extractVolumeFromPath(filePath.toString());
+                        volumeManager.incrementFileCount(volume);
+                        log.info("Restored metadata for fileId={} from volume {}", fileId, volume);
+                        message.reply(metadataToJson(metadata));
+                    } else {
+                        log.error("Failed to cache restored metadata for {}", fileId, putResult.cause());
+                        message.fail(AppConstants.HTTP_INTERNAL_ERROR, "Failed to cache restored metadata");
+                    }
+                });
+            } else {
+                message.fail(AppConstants.HTTP_NOT_FOUND, AppConstants.ERR_FILE_NOT_FOUND);
+            }
+        });
+    }
+
+    @Override
+    public void handleList(@NotNull JsonObject msg, Message<Object> message) {
         int page = msg.getInteger(AppConstants.FIELD_PAGE, 1);
         int size = msg.getInteger(AppConstants.FIELD_SIZE, AppConfig.defaultPageSize());
         size = Math.min(size, AppConfig.maxPageSize());
@@ -539,7 +628,6 @@ public class FileProcessorVerticle extends AbstractVerticle {
         String order = msg.getString(AppConstants.FIELD_ORDER, "asc");
 
         if (queryService != null) {
-            log.debug("Using QueryService for list");
             queryService.listFiles(page, size, prefix, sort, order)
                     .onSuccess(message::reply)
                     .onFailure(err -> {
@@ -547,55 +635,66 @@ public class FileProcessorVerticle extends AbstractVerticle {
                         message.fail(AppConstants.HTTP_INTERNAL_ERROR, AppConstants.ERR_LIST_FAILED);
                     });
         } else if (AppConfig.isClustered()) {
-            log.debug("Using Infinispan keyStream for list (clustered fallback)");
             handleListWithKeyStream(page, size, prefix, sort, order, message);
         } else {
-            log.debug("Using filesystem scan for list (non-clustered)");
             handleListWithFileSystemScan(page, size, prefix, sort, order, message);
         }
     }
 
-    private void handleDownload(@NotNull JsonObject msg, Message<Object> message) {
-        String fileId = msg.getString(AppConstants.FIELD_FILE_ID);
-        log.info("Handling download: fileId={}", fileId);
+    private void handleListWithFileSystemScan(int page, int size, String prefix,
+                                              String sort, String order, Message<Object> message) {
+        boolean asc = !"desc".equalsIgnoreCase(order);
+        List<String> volumes = new ArrayList<>(volumeManager.getVolumes().keySet());
 
-        fileMetadataMap.get(fileId, getResult -> {
-            if (getResult.succeeded() && getResult.result() != null) {
-                FileMetadata metadata = getResult.result();
-                String filePath = metadata.getFilePath();
+        vertx.executeBlocking(promise -> {
+            List<FileMetadata> allMetadata = new ArrayList<>();
 
-                log.debug("Download requested for fileId={}, path={}", fileId, filePath);
+            for (String volumePath : volumes) {
+                try (DirectoryStream<Path> stream = Files.newDirectoryStream(Path.of(volumePath))) {
+                    for (Path path : stream) {
+                        String fileName = path.getFileName().toString();
+                        int underscoreIndex = fileName.indexOf('_');
+                        if (underscoreIndex > 0) {
+                            String fileId = fileName.substring(0, underscoreIndex);
+                            String actualFileName = fileName.substring(underscoreIndex + 1);
+                            if (prefix.isEmpty() || actualFileName.startsWith(prefix)) {
+                                try {
+                                    FileTime lastModified = Files.getLastModifiedTime(path);
+                                    Instant updatedAt = lastModified.toInstant();
+                                    Instant createdAt = getCreationTime(path, updatedAt);
+                                    String contentType = Files.probeContentType(path);
+                                    if (contentType == null) contentType = "application/octet-stream";
 
-                vertx.fileSystem().exists(filePath, existsResult -> {
-                    if (existsResult.succeeded() && existsResult.result()) {
-                        vertx.fileSystem().props(filePath, propsResult -> {
-                            if (propsResult.succeeded()) {
-                                JsonObject response = new JsonObject()
-                                        .put(AppConstants.FIELD_STATUS, AppConstants.STATUS_OK)
-                                        .put(AppConstants.FIELD_FILE_PATH, filePath)
-                                        .put(AppConstants.FIELD_FILE_NAME, metadata.getFileName())
-                                        .put(AppConstants.FIELD_CONTENT_TYPE, metadata.getContentType())
-                                        .put(AppConstants.FIELD_SIZE, propsResult.result().size());
-                                message.reply(response);
-                                log.info("Download prepared: fileId={}, size={}", fileId, propsResult.result().size());
-                            } else {
-                                log.error("Failed to get file properties for fileId={}: {}", fileId, propsResult.cause().getMessage());
-                                message.fail(AppConstants.HTTP_INTERNAL_ERROR, "Failed to get file properties");
+                                    FileMetadata meta = new FileMetadata(
+                                            fileId, actualFileName, path.toString(), contentType,
+                                            Files.size(path), createdAt, updatedAt
+                                    );
+                                    allMetadata.add(meta);
+                                } catch (IOException e) {
+                                    log.warn("Failed to read file metadata for: {}", path, e);
+                                }
                             }
-                        });
-                    } else {
-                        log.warn("Download failed - file not found on disk: fileId={}, path={}", fileId, filePath);
-                        message.fail(AppConstants.HTTP_NOT_FOUND, AppConstants.ERR_FILE_NOT_FOUND);
+                        }
                     }
-                });
+                } catch (IOException e) {
+                    log.warn("Failed to scan volume: {}", volumePath, e);
+                }
+            }
+            promise.complete(allMetadata);
+        }, asyncResult -> {
+            if (asyncResult.succeeded()) {
+                @SuppressWarnings("unchecked")
+                List<FileMetadata> allMetadata = (List<FileMetadata>) asyncResult.result();
+                processResults(allMetadata, page, size, sort, asc, message);
             } else {
-                log.warn("Download failed - metadata not found: fileId={}", fileId);
-                message.fail(AppConstants.HTTP_NOT_FOUND, AppConstants.ERR_FILE_NOT_FOUND);
+                log.error("Filesystem scan failed", asyncResult.cause());
+                message.fail(AppConstants.HTTP_INTERNAL_ERROR, AppConstants.ERR_LIST_FAILED);
             }
         });
     }
 
-    private void handleListWithKeyStream(int page, int size, String prefix, String sort, String order, Message<Object> message) {
+    private void handleListWithKeyStream(int page, int size, String prefix,
+                                         String sort, String order, Message<Object> message) {
         boolean asc = !"desc".equalsIgnoreCase(order);
 
         try {
@@ -644,72 +743,8 @@ public class FileProcessorVerticle extends AbstractVerticle {
         }
     }
 
-    private void handleListWithFileSystemScan(int page, int size, String prefix,
-                                              String sort, String order, Message<Object> message) {
-        boolean asc = !"desc".equalsIgnoreCase(order);
-
-        vertx.executeBlocking(promise -> {
-            List<FileMetadata> allMetadata = new ArrayList<>();
-
-            try (DirectoryStream<Path> stream = Files.newDirectoryStream(Path.of(nfsPath))) {
-                for (Path path : stream) {
-                    String fileName = path.getFileName().toString();
-                    int underscoreIndex = fileName.indexOf('_');
-
-                    if (underscoreIndex > 0) {
-                        String fileId = fileName.substring(0, underscoreIndex);
-                        String actualFileName = fileName.substring(underscoreIndex + 1);
-
-                        if (prefix.isEmpty() || actualFileName.startsWith(prefix)) {
-                            try {
-                                FileTime lastModified = Files.getLastModifiedTime(path);
-                                Instant updatedAt = lastModified.toInstant();
-                                Instant createdAt;
-                                try {
-                                    FileTime creationTime = (FileTime) Files.getAttribute(path, "creationTime");
-                                    createdAt = creationTime != null ? creationTime.toInstant() : updatedAt;
-                                } catch (Exception e) {
-                                    createdAt = updatedAt;
-                                }
-
-                                String contentType = Files.probeContentType(path);
-                                if (contentType == null) {
-                                    contentType = "application/octet-stream";
-                                }
-
-                                FileMetadata meta = new FileMetadata(
-                                        fileId,
-                                        actualFileName,
-                                        path.toString(),
-                                        contentType,
-                                        Files.size(path),
-                                        createdAt,
-                                        updatedAt
-                                );
-                                allMetadata.add(meta);
-                            } catch (IOException e) {
-                                log.warn("Failed to read file metadata for: {}", path, e);
-                            }
-                        }
-                    }
-                }
-                promise.complete(allMetadata);
-            } catch (IOException e) {
-                promise.fail(e);
-            }
-        }, asyncResult -> {
-            if (asyncResult.succeeded()) {
-                @SuppressWarnings("unchecked")
-                List<FileMetadata> allMetadata = (List<FileMetadata>) asyncResult.result();
-                processResults(allMetadata, page, size, sort, asc, message);
-            } else {
-                log.error("Filesystem scan failed", asyncResult.cause());
-                message.fail(AppConstants.HTTP_INTERNAL_ERROR, AppConstants.ERR_LIST_FAILED);
-            }
-        });
-    }
-
-    private void processResults(@NotNull List<FileMetadata> metadata, int page, int size, String sort, boolean asc, Message<Object> message) {
+    private void processResults(@NotNull List<FileMetadata> metadata, int page, int size,
+                                String sort, boolean asc, Message<Object> message) {
         metadata.sort((a, b) -> {
             int cmp = switch (sort) {
                 case "size" -> Long.compare(a.getSize(), b.getSize());
@@ -727,16 +762,8 @@ public class FileProcessorVerticle extends AbstractVerticle {
         JsonArray filesArray = new JsonArray();
         for (int i = start; i < end; i++) {
             FileMetadata m = metadata.get(i);
-            filesArray.add(new JsonObject()
-                    .put(AppConstants.FIELD_FILE_ID, m.getFileId())
-                    .put(AppConstants.FIELD_FILE_NAME, m.getFileName())
-                    .put(AppConstants.FIELD_CONTENT_TYPE, m.getContentType())
-                    .put(AppConstants.FIELD_SIZE, m.getSize())
-                    .put(AppConstants.FIELD_CREATED_AT, m.getCreatedAt().toString())
-                    .put(AppConstants.FIELD_UPDATED_AT, m.getUpdatedAt().toString()));
+            filesArray.add(metadataToJson(m));
         }
-
-        log.info("List completed: total={}, returned={}, page={}, size={}", total, filesArray.size(), page, size);
 
         message.reply(new JsonObject()
                 .put(AppConstants.FIELD_FILES, filesArray)
@@ -745,50 +772,99 @@ public class FileProcessorVerticle extends AbstractVerticle {
                 .put(AppConstants.FIELD_TOTAL, total));
     }
 
-    private void withFileLock(String fileId, RunnableWithCompletion action, Message<Object> message) {
-        log.debug("Acquiring lock for fileId={}", fileId);
+    @Override
+    public void handleDownload(@NotNull JsonObject msg, Message<Object> message) {
+        String fileId = msg.getString(AppConstants.FIELD_FILE_ID);
 
-        vertx.sharedData().<String, FileMetadata>getClusterWideMap(FILE_METADATA_MAP, mapResult -> {
-            if (mapResult.failed()) {
-                log.error("Failed to get metadata map for lock: fileId={}", fileId);
-                message.fail(AppConstants.HTTP_INTERNAL_ERROR, "Failed to get metadata map");
-                return;
+        fileMetadataMap.get(fileId, getResult -> {
+            if (getResult.succeeded() && getResult.result() != null) {
+                FileMetadata metadata = getResult.result();
+                String filePath = metadata.getFilePath();
+                String fileName = metadata.getFileName();
+                String contentType = metadata.getContentType();
+
+                vertx.fileSystem().exists(filePath, existsResult -> {
+                    if (existsResult.succeeded() && existsResult.result()) {
+                        vertx.fileSystem().props(filePath, propsResult -> {
+                            if (propsResult.succeeded()) {
+                                JsonObject response = new JsonObject()
+                                        .put(AppConstants.FIELD_STATUS, AppConstants.STATUS_OK)
+                                        .put(AppConstants.FIELD_FILE_PATH, filePath)
+                                        .put(AppConstants.FIELD_FILE_NAME, fileName)
+                                        .put(AppConstants.FIELD_CONTENT_TYPE, contentType)
+                                        .put(AppConstants.FIELD_SIZE, propsResult.result().size());
+                                message.reply(response);
+                            } else {
+                                message.fail(AppConstants.HTTP_INTERNAL_ERROR, "Failed to get file properties");
+                            }
+                        });
+                    } else {
+                        message.fail(AppConstants.HTTP_NOT_FOUND, AppConstants.ERR_FILE_NOT_FOUND);
+                    }
+                });
+            } else {
+                message.fail(AppConstants.HTTP_NOT_FOUND, AppConstants.ERR_FILE_NOT_FOUND);
             }
-
-            vertx.sharedData().getLockWithTimeout("file-lock-" + fileId, AppConfig.fileUploadTimeout(), lockResult -> {
-                if (lockResult.failed()) {
-                    log.warn("Failed to acquire lock for fileId={}: {}", fileId, lockResult.cause().getMessage());
-                    message.fail(AppConstants.HTTP_INTERNAL_ERROR, "Failed to acquire lock: " + lockResult.cause().getMessage());
-                    return;
-                }
-
-                Lock lock = lockResult.result();
-                log.debug("Lock acquired for fileId={}", fileId);
-                try {
-                    action.run(mapResult.result(), () -> {
-                        log.debug("Releasing lock for fileId={}", fileId);
-                        lock.release();
-                    });
-                } catch (Exception e) {
-                    log.error("Error during locked operation for fileId={}: {}", fileId, e.getMessage(), e);
-                    lock.release();
-                    message.fail(AppConstants.HTTP_INTERNAL_ERROR, e.getMessage());
-                }
-            });
         });
     }
 
-    private void deleteFileOnly(String filePath, Runnable onSuccess, Runnable onFailure) {
-        log.debug("Attempting to delete file: {}", filePath);
-        vertx.fileSystem().delete(filePath, deleteResult -> {
-            if (deleteResult.succeeded()) {
-                log.debug("File deleted successfully: {}", filePath);
-                onSuccess.run();
-            } else {
-                log.warn("Failed to delete file: {}, error: {}", filePath, deleteResult.cause().getMessage());
-                onFailure.run();
+    private void withFileLock(String fileId, RunnableWithCompletion action, Message<Object> message) {
+        if (fileMetadataMap == null) {
+            message.fail(AppConstants.HTTP_INTERNAL_ERROR, "Metadata map not initialized");
+            return;
+        }
+
+        long operationTimeout = 60000;
+        AtomicBoolean completed = new AtomicBoolean(false);
+
+        vertx.sharedData().getLockWithTimeout("file-lock-" + fileId, AppConfig.fileUploadTimeout(), lockResult -> {
+            if (lockResult.failed()) {
+                message.fail(AppConstants.HTTP_INTERNAL_ERROR, "Failed to acquire lock: " + lockResult.cause().getMessage());
+                return;
+            }
+
+            Lock lock = lockResult.result();
+            AtomicInteger released = new AtomicInteger(0);
+
+            Runnable safeRelease = () -> {
+                if (released.compareAndSet(0, 1)) {
+                    lock.release();
+                    log.debug("Lock released for fileId={}", fileId);
+                }
+            };
+
+            long timerId = vertx.setTimer(operationTimeout, tid -> {
+                if (!completed.get()) {
+                    log.error("Operation timeout for fileId={}, forcing lock release", fileId);
+                    safeRelease.run();
+                    message.fail(AppConstants.HTTP_INTERNAL_ERROR, "Operation timeout");
+                }
+            });
+
+            try {
+                action.run(fileMetadataMap, () -> {
+                    if (!completed.getAndSet(true)) {
+                        vertx.cancelTimer(timerId);
+                        safeRelease.run();
+                    }
+                });
+            } catch (Exception e) {
+                if (!completed.getAndSet(true)) {
+                    vertx.cancelTimer(timerId);
+                    safeRelease.run();
+                    message.fail(AppConstants.HTTP_INTERNAL_ERROR, e.getMessage());
+                }
             }
         });
+    }
+
+    private @Nullable String extractVolumeFromPath(String filePath) {
+        for (VolumeState state : volumeManager.getVolumes().values()) {
+            if (filePath.startsWith(state.getPath())) {
+                return state.getPath();
+            }
+        }
+        return null;
     }
 
     private void syncToIndexedCache(String fileId, FileMetadata metadata) {
@@ -799,7 +875,7 @@ public class FileProcessorVerticle extends AbstractVerticle {
                         .put(fileId, metadata);
                 log.debug("Synced to indexed cache: fileId={}", fileId);
             } catch (Exception e) {
-                log.warn("Failed to sync to indexed cache for fileId={}: {}", fileId, e.getMessage());
+                log.warn("Failed to sync to indexed cache: {}", e.getMessage());
             }
         }
     }
@@ -812,8 +888,19 @@ public class FileProcessorVerticle extends AbstractVerticle {
                         .remove(fileId);
                 log.debug("Removed from indexed cache: fileId={}", fileId);
             } catch (Exception e) {
-                log.warn("Failed to remove from indexed cache for fileId={}: {}", fileId, e.getMessage());
+                log.warn("Failed to remove from indexed cache: {}", e.getMessage());
             }
         }
+    }
+
+    private JsonObject metadataToJson(@NotNull FileMetadata m) {
+        return new JsonObject()
+                .put(AppConstants.FIELD_FILE_ID, m.getFileId())
+                .put(AppConstants.FIELD_FILE_NAME, m.getFileName())
+                .put(AppConstants.FIELD_FILE_PATH, m.getFilePath())
+                .put(AppConstants.FIELD_CONTENT_TYPE, m.getContentType())
+                .put(AppConstants.FIELD_SIZE, m.getSize())
+                .put(AppConstants.FIELD_CREATED_AT, m.getCreatedAt().toString())
+                .put(AppConstants.FIELD_UPDATED_AT, m.getUpdatedAt().toString());
     }
 }

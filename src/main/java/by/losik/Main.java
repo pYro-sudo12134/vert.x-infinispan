@@ -3,8 +3,10 @@ package by.losik;
 import by.losik.config.AppConfig;
 import by.losik.config.MetricsConfig;
 import by.losik.config.VertxConfig;
+import by.losik.config.VolumeManagerConfig;
 import by.losik.verticle.FileProcessorVerticle;
 import by.losik.verticle.HttpVerticle;
+import by.losik.verticle.MigrationVerticle;
 import io.micrometer.core.instrument.binder.jvm.JvmGcMetrics;
 import io.micrometer.core.instrument.binder.jvm.JvmMemoryMetrics;
 import io.micrometer.core.instrument.binder.jvm.JvmThreadMetrics;
@@ -64,7 +66,9 @@ public class Main {
                         System.getenv().getOrDefault("DEFAULT_PAGE_SIZE", "100")))
                 .put("cluster.name", clusterName)
                 .put("node.id",
-                        System.getenv().getOrDefault("NODE_ID", "node-" + System.currentTimeMillis()));
+                        System.getenv().getOrDefault("NODE_ID", "node-" + System.currentTimeMillis()))
+                .put("volume.strategy",
+                        System.getenv().getOrDefault("VOLUME_STRATEGY", "hash"));
 
         log.info("Configuration loaded: Clustered={} HTTP Port={}, NFS Path={}, Upload Timeout={}ms, CORS Enabled={}",
                 config.getBoolean("clustered"),
@@ -129,6 +133,8 @@ public class Main {
             log.info("Shutdown hook finished");
         }));
 
+        VolumeManagerConfig.init(VertxConfig.vertx(), AppConfig.nodeId());
+
         int fsVerticles = Integer.parseInt(System.getenv().getOrDefault("FS_VERTICLES", "2"));
         log.info("Deploying {} FileProcessorVerticle instance(s)", fsVerticles);
         VertxConfig.vertx().deployVerticle(FileProcessorVerticle.class,
@@ -144,6 +150,16 @@ public class Main {
                                 .setHa(true))
                 .onSuccess(deploymentId -> log.info("HttpVerticle deployed successfully with ID: {}", deploymentId))
                 .onFailure(err -> log.error("Failed to deploy HttpVerticle: {}", err.getMessage(), err));
+
+        int migrationVerticles = Integer.parseInt(System.getenv().getOrDefault("MIGRATION_VERTICLES", "2"));
+        log.info("Deploying {} MigrationVerticle instance(s)", migrationVerticles);
+
+        VertxConfig.vertx().deployVerticle(MigrationVerticle.class,
+                        new DeploymentOptions()
+                                .setInstances(migrationVerticles)
+                                .setHa(true).setThreadingModel(ThreadingModel.WORKER))
+                .onSuccess(deploymentId -> log.info("MigrationVerticle deployed successfully with ID: {}", deploymentId))
+                .onFailure(err -> log.error("Failed to deploy MigrationVerticle: {}", err.getMessage(), err));
 
         MetricsConfig.setupMetricsServer();
 

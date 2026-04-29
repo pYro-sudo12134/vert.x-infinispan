@@ -3,6 +3,7 @@ package by.losik.verticle;
 import by.losik.config.AppConfig;
 import by.losik.config.EventBusConfig;
 import by.losik.config.RouterConfig;
+import by.losik.config.VolumeManagerConfig;
 import by.losik.constant.AppConstants;
 import io.vertx.core.AbstractVerticle;
 import io.vertx.core.eventbus.DeliveryOptions;
@@ -23,7 +24,7 @@ import java.util.Optional;
 import java.util.UUID;
 import java.util.stream.Collectors;
 
-public class HttpVerticle extends AbstractVerticle {
+public class HttpVerticle extends AbstractVerticle implements HttpProcessor {
     private static final Logger log = LoggerFactory.getLogger(HttpVerticle.class);
 
     @Override
@@ -66,10 +67,19 @@ public class HttpVerticle extends AbstractVerticle {
         router.put("/files/:id").handler(this::updateFile);
         router.get("/files").handler(this::listFiles);
         router.get("/download/:id").handler(this::downloadFile);
+        router.post("/admin/volumes").handler(this::addVolume);
+        router.delete("/admin/volumes/:path").handler(this::removeVolume);
+        router.get("/admin/volumes/status").handler(this::getVolumeStatus);
+        router.post("/admin/migrate/:fileId").handler(this::migrateFile);
+        router.get("/admin/migrate/status/:fileId").handler(this::getMigrationStatus);
+        router.post("/admin/migrate/rollback/:fileId").handler(this::rollbackMigration);
+        router.post("/admin/migrate/volume/:source/:target").handler(this::migrateVolume);
         router.get("/health").handler(ctx -> {
             log.debug("Health check request received");
             ctx.response().end(AppConstants.STATUS_OK);
         });
+
+
 
         vertx.createHttpServer()
                 .requestHandler(router)
@@ -78,7 +88,8 @@ public class HttpVerticle extends AbstractVerticle {
                 .onFailure(err -> log.error("Failed to start HTTP server on port {}: {}", AppConfig.httpPort(), err.getMessage(), err));
     }
 
-    private void uploadFile(@NotNull RoutingContext ctx) {
+    @Override
+    public void uploadFile(@NotNull RoutingContext ctx) {
         log.info("Received upload request from: {}", ctx.request().remoteAddress());
 
         Optional.of(ctx.fileUploads())
@@ -128,7 +139,8 @@ public class HttpVerticle extends AbstractVerticle {
                 });
     }
 
-    private void getFile(@NotNull RoutingContext ctx) {
+    @Override
+    public void getFile(@NotNull RoutingContext ctx) {
         String fileId = ctx.pathParam(AppConstants.FIELD_ID);
         log.debug("Received get file request: fileId={}, from={}", fileId, ctx.request().remoteAddress());
 
@@ -151,7 +163,8 @@ public class HttpVerticle extends AbstractVerticle {
         });
     }
 
-    private void deleteFile(@NotNull RoutingContext ctx) {
+    @Override
+    public void deleteFile(@NotNull RoutingContext ctx) {
         String fileId = ctx.pathParam(AppConstants.FIELD_ID);
         log.info("Received delete request: fileId={}, from={}", fileId, ctx.request().remoteAddress());
 
@@ -174,7 +187,8 @@ public class HttpVerticle extends AbstractVerticle {
         });
     }
 
-    private void updateFile(@NotNull RoutingContext ctx) {
+    @Override
+    public void updateFile(@NotNull RoutingContext ctx) {
         String fileId = ctx.pathParam(AppConstants.FIELD_ID);
         log.info("Received update request: fileId={}, from={}", fileId, ctx.request().remoteAddress());
 
@@ -183,33 +197,45 @@ public class HttpVerticle extends AbstractVerticle {
                 .map(uploads -> uploads.iterator().next())
                 .ifPresentOrElse(upload -> {
                     String tempPath = upload.uploadedFileName();
+                    var getMessage = new JsonObject()
+                            .put(AppConstants.FIELD_ACTION, AppConstants.ACTION_GET)
+                            .put(AppConstants.FIELD_FILE_ID, fileId);
 
-                    log.debug("Processing update: fileId={}, newFileName={}, contentType={}, tempPath={}",
-                            fileId, upload.fileName(), upload.contentType(), tempPath);
-
-                    var message = new JsonObject()
-                            .put(AppConstants.FIELD_ACTION, AppConstants.ACTION_UPDATE)
-                            .put(AppConstants.FIELD_FILE_ID, fileId)
-                            .put(AppConstants.FIELD_FILE_NAME, upload.fileName())
-                            .put(AppConstants.FIELD_FILE_PATH, tempPath)
-                            .put(AppConstants.FIELD_CONTENT_TYPE, upload.contentType());
-
-                    EventBusConfig.eventBus().request(EventBusConfig.FILE_UPDATE_ADDRESS, message, reply -> {
-                        if (reply.succeeded()) {
-                            log.info("Update successful: fileId={}, newFileName={}", fileId, upload.fileName());
-                            ctx.response()
-                                    .setStatusCode(AppConstants.HTTP_OK)
-                                    .end(AppConstants.STATUS_UPDATED);
-                        } else {
-                            log.error("Update failed for fileId={}, fileName={}: {}",
-                                    fileId, upload.fileName(), reply.cause().getMessage());
-
-                            vertx.fileSystem().delete(tempPath)
-                                    .onFailure(err -> log.warn("Temp file cleanup failed: {}", tempPath, err));
-                            ctx.response()
-                                    .setStatusCode(AppConstants.HTTP_INTERNAL_ERROR)
-                                    .end(AppConstants.ERR_UPDATE_FAILED);
+                    EventBusConfig.eventBus().request(EventBusConfig.FILE_GET_ADDRESS, getMessage, getReply -> {
+                        if (getReply.failed()) {
+                            log.error("Update failed - file not found: fileId={}", fileId);
+                            ctx.response().setStatusCode(AppConstants.HTTP_NOT_FOUND).end(AppConstants.ERR_FILE_NOT_FOUND);
+                            return;
                         }
+
+                        JsonObject metadata = (JsonObject) getReply.result().body();
+                        String existingFileName = metadata.getString(AppConstants.FIELD_FILE_NAME);
+
+                        log.debug("Processing update: fileId={}, existingFileName={}, contentType={}, tempPath={}",
+                                fileId, existingFileName, upload.contentType(), tempPath);
+
+                        var updateMessage = new JsonObject()
+                                .put(AppConstants.FIELD_ACTION, AppConstants.ACTION_UPDATE)
+                                .put(AppConstants.FIELD_FILE_ID, fileId)
+                                .put(AppConstants.FIELD_FILE_NAME, existingFileName)
+                                .put(AppConstants.FIELD_FILE_PATH, tempPath)
+                                .put(AppConstants.FIELD_CONTENT_TYPE, upload.contentType());
+
+                        EventBusConfig.eventBus().request(EventBusConfig.FILE_UPDATE_ADDRESS, updateMessage, updateReply -> {
+                            if (updateReply.succeeded()) {
+                                log.info("Update successful: fileId={}, fileName={}", fileId, existingFileName);
+                                ctx.response()
+                                        .setStatusCode(AppConstants.HTTP_OK)
+                                        .end(AppConstants.STATUS_UPDATED);
+                            } else {
+                                log.error("Update failed for fileId={}: {}", fileId, updateReply.cause().getMessage());
+                                vertx.fileSystem().delete(tempPath)
+                                        .onFailure(err -> log.warn("Temp file cleanup failed: {}", tempPath, err));
+                                ctx.response()
+                                        .setStatusCode(AppConstants.HTTP_INTERNAL_ERROR)
+                                        .end(AppConstants.ERR_UPDATE_FAILED);
+                            }
+                        });
                     });
                 }, () -> {
                     log.warn("Update request rejected - no file provided: fileId={}", fileId);
@@ -219,7 +245,8 @@ public class HttpVerticle extends AbstractVerticle {
                 });
     }
 
-    private void listFiles(@NotNull RoutingContext ctx) {
+    @Override
+    public void listFiles(@NotNull RoutingContext ctx) {
         int page = Integer.parseInt(ctx.request().getParam(AppConstants.FIELD_PAGE, "1"));
         int size = Integer.parseInt(ctx.request().getParam(AppConstants.FIELD_SIZE, "100"));
         String prefix = ctx.request().getParam(AppConstants.FIELD_PREFIX, "");
@@ -252,7 +279,8 @@ public class HttpVerticle extends AbstractVerticle {
         });
     }
 
-    private void downloadFile(@NotNull RoutingContext ctx) {
+    @Override
+    public void downloadFile(@NotNull RoutingContext ctx) {
         String fileId = ctx.pathParam(AppConstants.FIELD_ID);
         log.info("Received download request: fileId={}", fileId);
 
@@ -295,5 +323,164 @@ public class HttpVerticle extends AbstractVerticle {
                         .end(AppConstants.ERR_FILE_NOT_FOUND);
             }
         });
+    }
+
+    @Override
+    public void addVolume(@NotNull RoutingContext ctx) {
+        JsonObject body = ctx.body().asJsonObject();
+        String volumePath = body.getString("path");
+
+        if (volumePath == null || volumePath.isBlank()) {
+            ctx.response().setStatusCode(AppConstants.HTTP_BAD_REQUEST).end("Missing 'path' parameter");
+            return;
+        }
+
+        VolumeManagerConfig.volumeManager().addVolume(volumePath)
+                .onSuccess(v -> {
+                    log.info("Volume added via API: {}", volumePath);
+                    ctx.response().end(new JsonObject()
+                            .put("status", "success")
+                            .put("message", "Volume added: " + volumePath)
+                            .encode());
+                })
+                .onFailure(err -> {
+                    log.error("Failed to add volume: {}", volumePath, err);
+                    ctx.response().setStatusCode(AppConstants.HTTP_INTERNAL_ERROR).end(new JsonObject()
+                            .put("status", "error")
+                            .put("message", err.getMessage())
+                            .encode());
+                });
+    }
+
+    @Override
+    public void removeVolume(@NotNull RoutingContext ctx) {
+        String volumePath = ctx.pathParam("path");
+        String targetVolume = ctx.request().getParam("target");
+
+        if (volumePath == null || volumePath.isBlank()) {
+            ctx.response().setStatusCode(AppConstants.HTTP_BAD_REQUEST).end("Missing volume path");
+            return;
+        }
+
+        VolumeManagerConfig.volumeManager().removeVolume(volumePath, targetVolume)
+                .onSuccess(v -> {
+                    log.info("Volume removed via API: {}", volumePath);
+                    ctx.response().end(new JsonObject()
+                            .put("status", "success")
+                            .put("message", "Volume removed: " + volumePath)
+                            .encode());
+                })
+                .onFailure(err -> {
+                    log.error("Failed to remove volume: {}", volumePath, err);
+                    ctx.response().setStatusCode(AppConstants.HTTP_INTERNAL_ERROR).end(new JsonObject()
+                            .put("status", "error")
+                            .put("message", err.getMessage())
+                            .encode());
+                });
+    }
+
+    @Override
+    public void getVolumeStatus(@NotNull RoutingContext ctx) {
+        ctx.response()
+                .putHeader("Content-Type", "application/json")
+                .end(VolumeManagerConfig.volumeManager().getStatus().encodePrettily());
+    }
+
+    @Override
+    public void migrateFile(@NotNull RoutingContext ctx) {
+        String fileId = ctx.pathParam("fileId");
+        JsonObject body = ctx.body().asJsonObject();
+        String targetVolume = body.getString("targetVolume");
+
+        if (fileId == null || fileId.isBlank()) {
+            ctx.response().setStatusCode(AppConstants.HTTP_BAD_REQUEST).end("Missing fileId");
+            return;
+        }
+
+        if (targetVolume == null || targetVolume.isBlank()) {
+            ctx.response().setStatusCode(AppConstants.HTTP_BAD_REQUEST).end("Missing targetVolume");
+            return;
+        }
+
+        EventBusConfig.eventBus().send(EventBusConfig.MIGRATION_EXECUTE_ADDRESS,
+                new JsonObject()
+                        .put("fileId", fileId)
+                        .put("targetVolume", targetVolume));
+
+        ctx.response().end(new JsonObject()
+                .put("status", "accepted")
+                .put("message", "Migration started in background")
+                .put("fileId", fileId)
+                .put("targetVolume", targetVolume)
+                .encode());
+    }
+
+    @Override
+    public void getMigrationStatus(@NotNull RoutingContext ctx) {
+        String fileId = ctx.pathParam("fileId");
+
+        if (fileId == null || fileId.isBlank()) {
+            ctx.response().setStatusCode(AppConstants.HTTP_BAD_REQUEST).end("Missing fileId");
+            return;
+        }
+
+        EventBusConfig.eventBus().<JsonObject>request(EventBusConfig.MIGRATION_STATUS_ADDRESS,
+                new JsonObject().put("fileId", fileId),
+                reply -> {
+                    if (reply.succeeded()) {
+                        ctx.response().end(reply.result().body().encode());
+                    } else {
+                        ctx.response().setStatusCode(AppConstants.HTTP_INTERNAL_ERROR).end(new JsonObject()
+                                .put("error", reply.cause().getMessage())
+                                .encode());
+                    }
+                });
+    }
+
+    @Override
+    public void rollbackMigration(@NotNull RoutingContext ctx) {
+        String fileId = ctx.pathParam("fileId");
+
+        if (fileId == null || fileId.isBlank()) {
+            ctx.response().setStatusCode(AppConstants.HTTP_BAD_REQUEST).end("Missing fileId");
+            return;
+        }
+
+        EventBusConfig.eventBus().send(EventBusConfig.MIGRATION_ROLLBACK_ADDRESS,
+                new JsonObject().put("fileId", fileId));
+
+        ctx.response().end(new JsonObject()
+                .put("status", "accepted")
+                .put("message", "Rollback started in background")
+                .put("fileId", fileId)
+                .encode());
+    }
+
+    @Override
+    public void migrateVolume(@NotNull RoutingContext ctx) {
+        String sourceVolume = ctx.pathParam("source");
+        String targetVolume = ctx.pathParam("target");
+
+        if (sourceVolume == null || sourceVolume.isBlank()) {
+            ctx.response().setStatusCode(AppConstants.HTTP_BAD_REQUEST).end("Missing source volume");
+            return;
+        }
+
+        if (targetVolume == null || targetVolume.isBlank()) {
+            ctx.response().setStatusCode(AppConstants.HTTP_BAD_REQUEST).end("Missing target volume");
+            return;
+        }
+
+        EventBusConfig.eventBus().send(EventBusConfig.MIGRATION_VOLUME_ADDRESS,
+                new JsonObject()
+                        .put("sourceVolume", sourceVolume)
+                        .put("targetVolume", targetVolume));
+
+        ctx.response().end(new JsonObject()
+                .put("status", "accepted")
+                .put("message", "Volume migration started in background")
+                .put("sourceVolume", sourceVolume)
+                .put("targetVolume", targetVolume)
+                .encode());
     }
 }

@@ -2,27 +2,42 @@ version: '3.8'
 
 services:
   nfs-server:
-    image: itsthenetwork/nfs-server-alpine:latest
+    image: erichough/nfs-server:2.2.0
     container_name: nfs-server
     privileged: true
     environment:
-      - SHARED_DIRECTORY=/nfs
+      - NFS_EXPORT_0=/nfs/nfs1 *(rw,no_root_squash,no_subtree_check,crossmnt)
+      - NFS_EXPORT_1=/nfs/nfs2 *(rw,no_root_squash,no_subtree_check,crossmnt)
+      - NFS_EXPORT_2=/nfs/nfs3 *(rw,no_root_squash,no_subtree_check,crossmnt)
     volumes:
-      - nfs-storage:/nfs
+      - nfs-storage-1:/nfs/nfs1
+      - nfs-storage-2:/nfs/nfs2
+      - nfs-storage-3:/nfs/nfs3
     ports:
       - "2049:2049"
     networks:
       - vertx-net
+    command: >
+      sh -c "
+        mkdir -p /nfs/nfs1 /nfs/nfs2 /nfs/nfs3 &&
+        chown 1000:1000 /nfs/nfs1 /nfs/nfs2 /nfs/nfs3 &&
+        chmod 755 /nfs/nfs1 /nfs/nfs2 /nfs/nfs3 &&
+        /usr/local/bin/start_nfsd.sh
+      "
 
   vertx-node-1:
-    image: pyrodocker1/kinda-nfs:1.0
+    image: pyrodocker1/kinda-nfs:2.0
     container_name: vertx-node-1
+    user: root
+    privileged: true
     ports:
       - "8081:8080"
       - "8082:8079"
     environment:
       - HTTP_SERVER_PORT=8080
-      - NFS_MOUNT_PATH=/mnt/nfs
+      - NFS_PATH=/mnt/nfs
+      - NFS_VOLUMES=/mnt/nfs1,/mnt/nfs2,/mnt/nfs3
+      - READ_ONLY_VOLUMES=/mnt/nfs1
       - NODE_ID=node-1
       - CLUSTERED=true
       - CLUSTER_NAME=vertx-cluster
@@ -32,7 +47,9 @@ services:
       - JGROUPS_EXTERNAL_ADDR=localhost
       - JGROUPS_EXTERNAL_PORT=7800
     volumes:
-      - nfs-storage:/mnt/nfs
+      - nfs-storage-1:/mnt/nfs1
+      - nfs-storage-2:/mnt/nfs2
+      - nfs-storage-3:/mnt/nfs3
       - temp-uploads:/tmp/file-uploads
       - infinispan-indexes-1:/tmp/infinispan-indexes
     restart: on-failure
@@ -42,14 +59,17 @@ services:
       - nfs-server
 
   vertx-node-2:
-    image: pyrodocker1/kinda-nfs:1.0
+    image: pyrodocker1/kinda-nfs:2.0
     container_name: vertx-node-2
+    user: root
+    privileged: true
     ports:
       - "8083:8080"
       - "8084:8079"
     environment:
       - HTTP_SERVER_PORT=8080
-      - NFS_MOUNT_PATH=/mnt/nfs
+      - NFS_VOLUMES=/mnt/nfs1,/mnt/nfs2,/mnt/nfs3
+      - READ_ONLY_VOLUMES=/mnt/nfs2
       - NODE_ID=node-2
       - CLUSTERED=true
       - CLUSTER_NAME=vertx-cluster
@@ -59,7 +79,9 @@ services:
       - JGROUPS_EXTERNAL_ADDR=localhost
       - JGROUPS_EXTERNAL_PORT=7800
     volumes:
-      - nfs-storage:/mnt/nfs
+      - nfs-storage-1:/mnt/nfs1
+      - nfs-storage-2:/mnt/nfs2
+      - nfs-storage-3:/mnt/nfs3
       - temp-uploads:/tmp/file-uploads
       - infinispan-indexes-2:/tmp/infinispan-indexes
     restart: on-failure
@@ -70,14 +92,17 @@ services:
       - vertx-node-1
 
   vertx-node-3:
-    image: pyrodocker1/kinda-nfs:1.0
+    image: pyrodocker1/kinda-nfs:2.0
     container_name: vertx-node-3
+    user: root
+    privileged: true
     ports:
       - "8085:8080"
       - "8086:8079"
     environment:
       - HTTP_SERVER_PORT=8080
-      - NFS_MOUNT_PATH=/mnt/nfs
+      - NFS_VOLUMES=/mnt/nfs1,/mnt/nfs2,/mnt/nfs3
+      - READ_ONLY_VOLUMES=/mnt/nfs3
       - NODE_ID=node-3
       - CLUSTERED=true
       - CLUSTER_NAME=vertx-cluster
@@ -87,7 +112,9 @@ services:
       - JGROUPS_EXTERNAL_ADDR=localhost
       - JGROUPS_EXTERNAL_PORT=7800
     volumes:
-      - nfs-storage:/mnt/nfs
+      - nfs-storage-1:/mnt/nfs1
+      - nfs-storage-2:/mnt/nfs2
+      - nfs-storage-3:/mnt/nfs3
       - temp-uploads:/tmp/file-uploads
       - infinispan-indexes-3:/tmp/infinispan-indexes
     restart: on-failure
@@ -98,12 +125,13 @@ services:
       - vertx-node-2
 
 volumes:
-  nfs-storage:
-    driver: local
   temp-uploads:
   infinispan-indexes-1:
   infinispan-indexes-2:
   infinispan-indexes-3:
+  nfs-storage-1:
+  nfs-storage-2:
+  nfs-storage-3:
 
 networks:
   vertx-net:

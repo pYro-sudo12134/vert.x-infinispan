@@ -59,6 +59,7 @@ public class FileQueryService {
                     filesArray.add(new JsonObject()
                             .put("fileId", meta.getFileId())
                             .put("fileName", meta.getFileName())
+                            .put("filePath", meta.getFilePath())
                             .put("contentType", meta.getContentType())
                             .put("size", meta.getSize())
                             .put("createdAt", meta.getCreatedAt().toString())
@@ -88,7 +89,7 @@ public class FileQueryService {
             case "date", "createdAt" -> "createdAt";
             case "updatedAt" -> "updatedAt";
             case "name", "fileName" -> "fileName";
-            default -> "fileName";
+            default -> "filePath";
         };
     }
 }

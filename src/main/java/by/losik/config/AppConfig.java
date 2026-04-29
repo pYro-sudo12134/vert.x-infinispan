@@ -1,7 +1,11 @@
 package by.losik.config;
 
 import io.vertx.core.json.JsonObject;
+
+import java.util.Arrays;
+import java.util.List;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.stream.Collectors;
 
 public class AppConfig {
     private static final AtomicReference<JsonObject> config = new AtomicReference<>();
@@ -26,8 +30,8 @@ public class AppConfig {
         return config.get().getInteger("metrics.port", 8079);
     }
 
-    public static String nfsPath() {
-        return config.get().getString("nfs.path", "/mnt/nfs");
+    public static String nodeId() {
+        return config.get().getString("node.id", "node-" + System.currentTimeMillis());
     }
 
     public static long fileUploadTimeout() {
@@ -61,4 +65,28 @@ public class AppConfig {
     public static int defaultPageSize() {
         return config.get().getInteger("default.page.size", 100);
     }
+
+    public static List<String> nfsVolumes() {
+        return Arrays.stream(
+                        System.getenv()
+                                .getOrDefault("NFS_VOLUMES",
+                                        System.getenv()
+                                                .getOrDefault("NFS_MOUNT_PATH", "/mnt/nfs"))
+                                .split(","))
+                .map(String::trim).collect(Collectors.toList());
+    }
+
+    public static List<String> readOnlyVolumes() {
+        return Arrays.stream(
+                        System.getenv()
+                                .getOrDefault("READ_ONLY_VOLUMES","")
+                                .split(","))
+                .map(String::trim).collect(Collectors.toList());
+    }
+
+    public static String volumeStrategy() {
+        return config.get().getString("volume.strategy", "hash");
+    }
+
+
 }
