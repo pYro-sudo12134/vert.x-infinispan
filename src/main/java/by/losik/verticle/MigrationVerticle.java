@@ -39,8 +39,8 @@ public class MigrationVerticle extends AbstractVerticle implements MigrationHand
     @Override
     public void handleMigration(@NotNull Message<JsonObject> message) {
         JsonObject body = message.body();
-        String fileId = body.getString("fileId");
-        String targetVolume = body.getString("targetVolume");
+        String fileId = body.getString(AppConstants.FIELD_FILE_ID);
+        String targetVolume = body.getString(AppConstants.FIELD_TARGET_VOLUME);
 
         if (fileId == null || targetVolume == null) {
             message.fail(AppConstants.HTTP_BAD_REQUEST, "Missing fileId or targetVolume");
@@ -53,9 +53,9 @@ public class MigrationVerticle extends AbstractVerticle implements MigrationHand
                 .onSuccess(v -> {
                     log.info("Migration completed: fileId={} -> {}", fileId, targetVolume);
                     message.reply(new JsonObject()
-                            .put("status", "completed")
-                            .put("fileId", fileId)
-                            .put("targetVolume", targetVolume));
+                            .put(AppConstants.FIELD_STATUS, "completed")
+                            .put(AppConstants.FIELD_FILE_ID, fileId)
+                            .put(AppConstants.FIELD_TARGET_VOLUME, targetVolume));
                 })
                 .onFailure(err -> {
                     log.error("Migration failed: fileId={} -> {}", fileId, targetVolume, err);
@@ -66,7 +66,7 @@ public class MigrationVerticle extends AbstractVerticle implements MigrationHand
     @Override
     public void handleRollback(@NotNull Message<JsonObject> message) {
         JsonObject body = message.body();
-        String fileId = body.getString("fileId");
+        String fileId = body.getString(AppConstants.FIELD_FILE_ID);
 
         if (fileId == null) {
             message.fail(AppConstants.HTTP_BAD_REQUEST, "Missing fileId");
@@ -79,8 +79,8 @@ public class MigrationVerticle extends AbstractVerticle implements MigrationHand
                 .onSuccess(v -> {
                     log.info("Rollback completed: fileId={}", fileId);
                     message.reply(new JsonObject()
-                            .put("status", "rolled_back")
-                            .put("fileId", fileId));
+                            .put(AppConstants.FIELD_STATUS, "rolled_back")
+                            .put(AppConstants.FIELD_FILE_ID, fileId));
                 })
                 .onFailure(err -> {
                     log.error("Rollback failed: fileId={}", fileId, err);
@@ -91,7 +91,7 @@ public class MigrationVerticle extends AbstractVerticle implements MigrationHand
     @Override
     public void handleStatus(@NotNull Message<JsonObject> message) {
         JsonObject body = message.body();
-        String fileId = body.getString("fileId");
+        String fileId = body.getString(AppConstants.FIELD_FILE_ID);
 
         if (fileId == null) {
             message.fail(AppConstants.HTTP_BAD_REQUEST, "Missing fileId");
@@ -104,16 +104,16 @@ public class MigrationVerticle extends AbstractVerticle implements MigrationHand
             message.reply(task.get().toJson());
         } else {
             message.reply(new JsonObject()
-                    .put("status", "not_found")
-                    .put("fileId", fileId));
+                    .put(AppConstants.FIELD_STATUS, "not_found")
+                    .put(AppConstants.FIELD_FILE_ID, fileId));
         }
     }
 
     @Override
     public void handleVolumeMigration(@NotNull Message<JsonObject> message) {
         JsonObject body = message.body();
-        String sourceVolume = body.getString("sourceVolume");
-        String targetVolume = body.getString("targetVolume");
+        String sourceVolume = body.getString(AppConstants.FIELD_SOURCE_VOLUME);
+        String targetVolume = body.getString(AppConstants.FIELD_TARGET_VOLUME);
 
         if (sourceVolume == null || targetVolume == null) {
             message.fail(AppConstants.HTTP_BAD_REQUEST, "Missing sourceVolume or targetVolume");
@@ -126,9 +126,9 @@ public class MigrationVerticle extends AbstractVerticle implements MigrationHand
                 .onSuccess(v -> {
                     log.info("Volume migration completed: {} -> {}", sourceVolume, targetVolume);
                     message.reply(new JsonObject()
-                            .put("status", "completed")
-                            .put("sourceVolume", sourceVolume)
-                            .put("targetVolume", targetVolume));
+                            .put(AppConstants.FIELD_STATUS, "completed")
+                            .put(AppConstants.FIELD_SOURCE_VOLUME, sourceVolume)
+                            .put(AppConstants.FIELD_TARGET_VOLUME, targetVolume));
                 })
                 .onFailure(err -> {
                     log.error("Volume migration failed: {} -> {}", sourceVolume, targetVolume, err);

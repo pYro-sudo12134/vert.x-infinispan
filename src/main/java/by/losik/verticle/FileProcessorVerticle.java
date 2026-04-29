@@ -41,7 +41,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 
 public class FileProcessorVerticle extends AbstractVerticle implements FileProcessor {
     private static final Logger log = LoggerFactory.getLogger(FileProcessorVerticle.class);
-    private static final String FILE_METADATA_MAP = "file.metadata";
+    public static final String FILE_METADATA_MAP = "file.metadata";
     private static final String FILE_METADATA_MAP_INDEXED = "file.metadata.indexed";
 
     private AsyncMap<String, FileMetadata> fileMetadataMap;

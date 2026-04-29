@@ -1,7 +1,9 @@
 package by.losik.volume;
 
+import by.losik.constant.AppConstants;
 import by.losik.meta.FileMetadata;
 import by.losik.util.MetadataHelper;
+import by.losik.verticle.FileProcessorVerticle;
 import io.vertx.core.AsyncResult;
 import io.vertx.core.Future;
 import io.vertx.core.Handler;
@@ -20,6 +22,7 @@ import java.time.Instant;
 import java.util.Base64;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -204,8 +207,8 @@ public class MigrationJournal {
             }
 
             Lock lock = lockResult.result();
-            String fileName = oldMetadata.getString("fileName");
-            String contentType = oldMetadata.getString("contentType");
+            String fileName = oldMetadata.getString(AppConstants.FIELD_FILE_NAME);
+            String contentType = oldMetadata.getString(AppConstants.FIELD_CONTENT_TYPE);
 
             if (fileName == null || fileName.isBlank()) {
                 lock.release();
@@ -215,7 +218,7 @@ public class MigrationJournal {
 
             FileMetadata newMetadata = new FileMetadata(
                     entry.getFileId(), fileName, entry.getTargetPath(), contentType,
-                    entry.getSize(), Instant.parse(oldMetadata.getString("createdAt")), Instant.now()
+                    entry.getSize(), Instant.parse(oldMetadata.getString(AppConstants.FIELD_CREATED_AT)), Instant.now()
             );
 
             updateMetadataDirect(entry.getFileId(), newMetadata)
@@ -236,7 +239,7 @@ public class MigrationJournal {
     private Future<Void> updateMetadataDirect(String fileId, FileMetadata metadata) {
         Promise<Void> promise = Promise.promise();
 
-        vertx.sharedData().<String, FileMetadata>getClusterWideMap("file.metadata", ar -> {
+        vertx.sharedData().<String, FileMetadata>getClusterWideMap(FileProcessorVerticle.FILE_METADATA_MAP, ar -> {
             if (ar.succeeded()) {
                 ar.result().put(fileId, metadata, putResult -> {
                     if (putResult.succeeded()) {
@@ -347,7 +350,7 @@ public class MigrationJournal {
         MetadataHelper.getMetadata(entry.getFileId()).onComplete(metadataResult -> {
             if (metadataResult.succeeded()) {
                 JsonObject metadata = metadataResult.result();
-                String currentPath = metadata.getString("filePath");
+                String currentPath = metadata.getString(AppConstants.FIELD_FILE_PATH);
 
                 if (currentPath.equals(entry.getTargetPath())) {
                     entry.setStatus(Status.COMMITTED);
@@ -496,21 +499,48 @@ public class MigrationJournal {
             JsonArray array = new JsonArray(readResult.result());
             for (int i = 0; i < array.size(); i++) {
                 JsonObject entry = array.getJsonObject(i);
-                if (entry.getString("fileId").equals(fileId)) {
+                if (entry.getString(AppConstants.FIELD_FILE_ID).equals(fileId)) {
                     promise.complete(new JsonObject()
-                            .put("status", entry.getString("status"))
-                            .put("error", entry.getString("error", ""))
-                            .put("checksum", entry.getString("checksum", ""))
-                            .put("sourcePath", entry.getString("sourcePath"))
-                            .put("targetPath", entry.getString("targetPath"))
-                            .put("size", entry.getLong("size"))
-                            .put("createdAt", entry.getString("createdAt"))
-                            .put("updatedAt", entry.getString("updatedAt")));
+                            .put(AppConstants.FIELD_STATUS, entry.getString(AppConstants.FIELD_STATUS))
+                            .put(AppConstants.FIELD_ERROR, entry.getString(AppConstants.FIELD_ERROR, ""))
+                            .put(AppConstants.FIELD_CHECKSUM, entry.getString(AppConstants.FIELD_CHECKSUM, ""))
+                            .put(AppConstants.FIELD_SOURCE_PATH, entry.getString(AppConstants.FIELD_SOURCE_PATH))
+                            .put(AppConstants.FIELD_TARGET_PATH, entry.getString(AppConstants.FIELD_TARGET_PATH))
+                            .put(AppConstants.FIELD_SIZE, entry.getLong(AppConstants.FIELD_SIZE))
+                            .put(AppConstants.FIELD_CREATED_AT, entry.getString(AppConstants.FIELD_CREATED_AT))
+                            .put(AppConstants.FIELD_UPDATED_AT, entry.getString(AppConstants.FIELD_UPDATED_AT)));
                     return;
                 }
             }
             promise.fail("No migration found for file: " + fileId);
         });
+
+        return promise.future();
+    }
+
+    public Future<Void> recordError(String fileId, String errorMessage) {
+        Promise<Void> promise = Promise.promise();
+
+        JournalEntry entry = entries.values().stream()
+                .filter(e -> e.getFileId().equals(fileId))
+                .findFirst()
+                .orElse(null);
+
+        Optional.ofNullable(entry).ifPresentOrElse(
+                journalEntry -> {
+                    journalEntry.setStatus(Status.FAILED);
+                    journalEntry.setErrorMessage(errorMessage);
+                    persistJournal();
+                    log.info("Recorded error for file {}: {}", fileId, errorMessage);
+                    promise.complete();
+                }, () -> {
+                    JournalEntry errorEntry = new JournalEntry(fileId, "", "", 0);
+                    errorEntry.setStatus(Status.FAILED);
+                    errorEntry.setErrorMessage(errorMessage);
+                    entries.put(errorEntry.getId(), errorEntry);
+                    persistJournal();
+                    promise.complete();
+                });
 
         return promise.future();
     }
@@ -549,10 +579,10 @@ public class MigrationJournal {
 
         public static JournalEntry fromJson(JsonObject json) {
             return new JournalEntry(
-                    json.getString("fileId"),
-                    json.getString("sourcePath"),
-                    json.getString("targetPath"),
-                    json.getLong("size")
+                    json.getString(AppConstants.FIELD_FILE_ID),
+                    json.getString(AppConstants.FIELD_SOURCE_PATH),
+                    json.getString(AppConstants.FIELD_TARGET_PATH),
+                    json.getLong(AppConstants.FIELD_SIZE)
             );
         }
 
@@ -604,15 +634,15 @@ public class MigrationJournal {
         public JsonObject toJson() {
             return new JsonObject()
                     .put("id", id)
-                    .put("fileId", fileId)
-                    .put("sourcePath", sourcePath)
-                    .put("targetPath", targetPath)
-                    .put("size", size)
-                    .put("status", status.toString())
-                    .put("checksum", checksum != null ? checksum : "")
-                    .put("error", errorMessage != null ? errorMessage : "")
-                    .put("createdAt", createdAt.toString())
-                    .put("updatedAt", updatedAt.toString());
+                    .put(AppConstants.FIELD_FILE_ID, fileId)
+                    .put(AppConstants.FIELD_SOURCE_PATH, sourcePath)
+                    .put(AppConstants.FIELD_TARGET_PATH, targetPath)
+                    .put(AppConstants.FIELD_SIZE, size)
+                    .put(AppConstants.FIELD_STATUS, status.toString())
+                    .put(AppConstants.FIELD_CHECKSUM, checksum != null ? checksum : "")
+                    .put(AppConstants.FIELD_ERROR, errorMessage != null ? errorMessage : "")
+                    .put(AppConstants.FIELD_CREATED_AT, createdAt.toString())
+                    .put(AppConstants.FIELD_UPDATED_AT, updatedAt.toString());
         }
     }
 }

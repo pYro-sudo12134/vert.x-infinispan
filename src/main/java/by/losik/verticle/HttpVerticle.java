@@ -341,15 +341,15 @@ public class HttpVerticle extends AbstractVerticle implements HttpProcessor {
                 .onSuccess(v -> {
                     log.info("Volume added via API: {}", volumePath);
                     ctx.response().end(new JsonObject()
-                            .put("status", "success")
-                            .put("message", "Volume added: " + volumePath)
+                            .put(AppConstants.FIELD_STATUS, "success")
+                            .put(AppConstants.FIELD_MESSAGE, "Volume added: " + volumePath)
                             .encode());
                 })
                 .onFailure(err -> {
                     log.error("Failed to add volume: {}", volumePath, err);
                     ctx.response().setStatusCode(AppConstants.HTTP_INTERNAL_ERROR).end(new JsonObject()
-                            .put("status", "error")
-                            .put("message", err.getMessage())
+                            .put(AppConstants.FIELD_STATUS, "error")
+                            .put(AppConstants.FIELD_MESSAGE, err.getMessage())
                             .encode());
                 });
     }
@@ -368,15 +368,15 @@ public class HttpVerticle extends AbstractVerticle implements HttpProcessor {
                 .onSuccess(v -> {
                     log.info("Volume removed via API: {}", volumePath);
                     ctx.response().end(new JsonObject()
-                            .put("status", "success")
-                            .put("message", "Volume removed: " + volumePath)
+                            .put(AppConstants.FIELD_STATUS, "success")
+                            .put(AppConstants.FIELD_MESSAGE, "Volume removed: " + volumePath)
                             .encode());
                 })
                 .onFailure(err -> {
                     log.error("Failed to remove volume: {}", volumePath, err);
                     ctx.response().setStatusCode(AppConstants.HTTP_INTERNAL_ERROR).end(new JsonObject()
-                            .put("status", "error")
-                            .put("message", err.getMessage())
+                            .put(AppConstants.FIELD_STATUS, AppConstants.ERR_DELETE_FAILED)
+                            .put(AppConstants.FIELD_MESSAGE, err.getMessage())
                             .encode());
                 });
     }
@@ -390,9 +390,9 @@ public class HttpVerticle extends AbstractVerticle implements HttpProcessor {
 
     @Override
     public void migrateFile(@NotNull RoutingContext ctx) {
-        String fileId = ctx.pathParam("fileId");
+        String fileId = ctx.pathParam(AppConstants.FIELD_FILE_ID);
         JsonObject body = ctx.body().asJsonObject();
-        String targetVolume = body.getString("targetVolume");
+        String targetVolume = body.getString(AppConstants.FIELD_TARGET_VOLUME);
 
         if (fileId == null || fileId.isBlank()) {
             ctx.response().setStatusCode(AppConstants.HTTP_BAD_REQUEST).end("Missing fileId");
@@ -412,20 +412,20 @@ public class HttpVerticle extends AbstractVerticle implements HttpProcessor {
 
         EventBusConfig.eventBus().send(EventBusConfig.MIGRATION_EXECUTE_ADDRESS,
                 new JsonObject()
-                        .put("fileId", fileId)
-                        .put("targetVolume", targetVolume));
+                        .put(AppConstants.FIELD_FILE_ID, fileId)
+                        .put(AppConstants.FIELD_TARGET_VOLUME, targetVolume));
 
         ctx.response().end(new JsonObject()
-                .put("status", "accepted")
-                .put("message", "Migration started in background")
-                .put("fileId", fileId)
-                .put("targetVolume", targetVolume)
+                .put(AppConstants.FIELD_STATUS, "accepted")
+                .put(AppConstants.FIELD_MESSAGE, "Migration started in background")
+                .put(AppConstants.FIELD_FILE_ID, fileId)
+                .put(AppConstants.FIELD_TARGET_VOLUME, targetVolume)
                 .encode());
     }
 
     @Override
     public void getMigrationStatus(@NotNull RoutingContext ctx) {
-        String fileId = ctx.pathParam("fileId");
+        String fileId = ctx.pathParam(AppConstants.FIELD_FILE_ID);
 
         if (fileId == null || fileId.isBlank()) {
             ctx.response().setStatusCode(AppConstants.HTTP_BAD_REQUEST).end("Missing fileId");
@@ -442,10 +442,24 @@ public class HttpVerticle extends AbstractVerticle implements HttpProcessor {
 
         vm.getJournalStatusFromFile(fileId).onComplete(statusResult -> {
             if (statusResult.succeeded()) {
-                ctx.response().end(statusResult.result().encode());
+                JsonObject result = statusResult.result();
+                String status = result.getString(AppConstants.FIELD_STATUS);
+                String error = result.getString(AppConstants.FIELD_ERROR);
+
+                if ("FAILED".equals(status) && error != null && !error.isEmpty()) {
+                    ctx.response().setStatusCode(AppConstants.HTTP_INTERNAL_ERROR).end(new JsonObject()
+                            .put(AppConstants.FIELD_STATUS, status)
+                            .put(AppConstants.FIELD_ERROR, error)
+                            .put(AppConstants.FIELD_FILE_ID, fileId)
+                            .put("sourcePath", result.getString("sourcePath"))
+                            .put("targetPath", result.getString("targetPath"))
+                            .encode());
+                } else {
+                    ctx.response().end(result.encode());
+                }
             } else {
-                ctx.response().setStatusCode(AppConstants.HTTP_BAD_REQUEST).end(new JsonObject()
-                        .put(AppConstants.FIELD_STATUS, AppConstants.ERR_FILE_NOT_FOUND)
+                ctx.response().setStatusCode(AppConstants.HTTP_NOT_FOUND).end(new JsonObject()
+                        .put(AppConstants.FIELD_STATUS, "not_found")
                         .put(AppConstants.FIELD_FILE_ID, fileId)
                         .encode());
             }
@@ -454,7 +468,7 @@ public class HttpVerticle extends AbstractVerticle implements HttpProcessor {
 
     @Override
     public void rollbackMigration(@NotNull RoutingContext ctx) {
-        String fileId = ctx.pathParam("fileId");
+        String fileId = ctx.pathParam(AppConstants.FIELD_FILE_ID);
 
         if (fileId == null || fileId.isBlank()) {
             ctx.response().setStatusCode(AppConstants.HTTP_BAD_REQUEST).end("Missing fileId");
@@ -462,12 +476,12 @@ public class HttpVerticle extends AbstractVerticle implements HttpProcessor {
         }
 
         EventBusConfig.eventBus().send(EventBusConfig.MIGRATION_ROLLBACK_ADDRESS,
-                new JsonObject().put("fileId", fileId));
+                new JsonObject().put(AppConstants.FIELD_FILE_ID, fileId));
 
         ctx.response().end(new JsonObject()
-                .put("status", "accepted")
-                .put("message", "Rollback started in background")
-                .put("fileId", fileId)
+                .put(AppConstants.FIELD_STATUS, "accepted")
+                .put(AppConstants.FIELD_MESSAGE, "Rollback started in background")
+                .put(AppConstants.FIELD_FILE_ID, fileId)
                 .encode());
     }
 
@@ -488,14 +502,14 @@ public class HttpVerticle extends AbstractVerticle implements HttpProcessor {
 
         EventBusConfig.eventBus().send(EventBusConfig.MIGRATION_VOLUME_ADDRESS,
                 new JsonObject()
-                        .put("sourceVolume", sourceVolume)
-                        .put("targetVolume", targetVolume));
+                        .put(AppConstants.FIELD_SOURCE_VOLUME, sourceVolume)
+                        .put(AppConstants.FIELD_TARGET_VOLUME, targetVolume));
 
         ctx.response().end(new JsonObject()
-                .put("status", "accepted")
-                .put("message", "Volume migration started in background")
-                .put("sourceVolume", sourceVolume)
-                .put("targetVolume", targetVolume)
+                .put(AppConstants.FIELD_STATUS, "accepted")
+                .put(AppConstants.FIELD_MESSAGE, "Volume migration started in background")
+                .put(AppConstants.FIELD_SOURCE_VOLUME, sourceVolume)
+                .put(AppConstants.FIELD_TARGET_VOLUME, targetVolume)
                 .encode());
     }
 }

@@ -2,6 +2,7 @@ package by.losik.volume;
 
 import by.losik.config.AppConfig;
 import by.losik.config.EventBusConfig;
+import by.losik.constant.AppConstants;
 import by.losik.meta.FileMetadata;
 import by.losik.util.MetadataHelper;
 import io.vertx.core.Future;
@@ -10,6 +11,7 @@ import io.vertx.core.Vertx;
 import io.vertx.core.json.JsonArray;
 import io.vertx.core.json.JsonObject;
 import org.jetbrains.annotations.NotNull;
+import org.jetbrains.annotations.Nullable;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -40,6 +42,7 @@ public class VolumeManager implements VolumeManagerFacade {
         initVolumes();
         startHealthChecker();
         recoverAfterCrash();
+        listenVolumeEvents();
     }
 
     private void initVolumes() {
@@ -63,6 +66,89 @@ public class VolumeManager implements VolumeManagerFacade {
                         volumePath, count, state.isReadOnly());
             });
         }
+    }
+
+    private void listenVolumeEvents() {
+        EventBusConfig.eventBus().consumer(EventBusConfig.VOLUME_EVENT_ADDRESS, message -> {
+            JsonObject body = (JsonObject) message.body();
+            String type = body.getString("type");
+            String sourceNode = body.getString("nodeId");
+            String volumePath = body.getString("volumePath");
+
+            if (sourceNode.equals(nodeId)) {
+                return;
+            }
+
+            if ("volume_added".equals(type)) {
+                log.info("Detected new volume {} added by node {}, updating local state", volumePath, sourceNode);
+                if (!volumes.containsKey(volumePath)) {
+                    VolumeState state = new VolumeState(volumePath);
+                    state.setHealthy(true);
+                    volumes.put(volumePath, state);
+                }
+            } else if ("volume_removed".equals(type)) {
+                log.info("Detected volume {} removed by node {}", volumePath, sourceNode);
+                volumes.remove(volumePath);
+            }
+        });
+    }
+
+    private void startHealthChecker() {
+        vertx.setPeriodic(10000, id -> {
+            List<String> configuredVolumes = AppConfig.nfsVolumes();
+
+            for (String volumePath : configuredVolumes) {
+                vertx.fileSystem().exists(volumePath, result -> {
+                    boolean exists = result.succeeded() && result.result();
+
+                    if (exists) {
+                        VolumeState state = volumes.get(volumePath);
+                        if (state == null) {
+                            log.info("Detected new volume: {}", volumePath);
+                            VolumeState newState = new VolumeState(volumePath);
+                            newState.setHealthy(true);
+
+                            List<String> readOnlyVolumes = AppConfig.readOnlyVolumes();
+                            if (readOnlyVolumes.contains(volumePath)) {
+                                newState.setReadOnly(true);
+                            }
+
+                            volumes.put(volumePath, newState);
+                            broadcastVolumeEvent("volume_added", volumePath);
+
+                            countFilesOnVolume(volumePath).onSuccess(count -> {
+                                newState.setFileCount(count);
+                                selector.updateVolumeStats(volumePath, count, 0);
+                                log.info("New volume {} initialized with {} files", volumePath, count);
+                            });
+                        } else {
+                            boolean healthy = state.isHealthy();
+                            if (!healthy) {
+                                state.setHealthy(true);
+                                log.info("Volume {} is back online", volumePath);
+                                broadcastVolumeEvent("volume_added", volumePath);
+                            }
+                        }
+                    } else {
+                        VolumeState state = volumes.get(volumePath);
+                        if (state != null && state.isHealthy()) {
+                            log.warn("Volume {} is no longer accessible", volumePath);
+                            state.setHealthy(false);
+                            broadcastVolumeEvent("volume_removed", volumePath);
+                        }
+                    }
+                });
+            }
+
+            for (VolumeState state : volumes.values()) {
+                if (!configuredVolumes.contains(state.getPath())) {
+                    log.warn("Volume {} not in config, marking as unhealthy", state.getPath());
+                    state.setHealthy(false);
+                }
+            }
+
+            cleanupMissingVolumes();
+        });
     }
 
     @Override
@@ -111,7 +197,7 @@ public class VolumeManager implements VolumeManagerFacade {
         state.setHealthy(true);
         volumes.put(volumePath, state);
 
-        broadcastVolumeEvent("added", volumePath);
+        broadcastVolumeEvent("volume_added", volumePath);
 
         log.info("Volume added: {}", volumePath);
         promise.complete();
@@ -151,12 +237,27 @@ public class VolumeManager implements VolumeManagerFacade {
                 .compose(v -> unmountVolume(volumePath))
                 .onSuccess(v -> {
                     volumes.remove(volumePath);
-                    broadcastVolumeEvent("removed", volumePath);
+                    broadcastVolumeEvent("volume_removed", volumePath);
                     promise.complete();
                 })
                 .onFailure(promise::fail);
 
         return promise.future();
+    }
+
+    private void cleanupMissingVolumes() {
+        List<String> configuredVolumes = AppConfig.nfsVolumes();
+
+        volumes.entrySet().removeIf(entry -> {
+            String volumePath = entry.getKey();
+            VolumeState state = entry.getValue();
+
+            if (!configuredVolumes.contains(volumePath) && !state.isHealthy() && state.getFileCount() == 0) {
+                log.info("Removing stale volume from memory: {}", volumePath);
+                return true;
+            }
+            return false;
+        });
     }
 
     @Override
@@ -212,12 +313,14 @@ public class VolumeManager implements VolumeManagerFacade {
 
         MetadataHelper.getMetadata(fileId).onComplete(metadataResult -> {
             if (metadataResult.failed()) {
-                promise.fail(metadataResult.cause());
+                String errorMsg = "Failed to get metadata: " + metadataResult.cause().getMessage();
+                journal.recordError(fileId, errorMsg)
+                        .onSuccess(v -> promise.fail(errorMsg));
                 return;
             }
 
             JsonObject metadata = metadataResult.result();
-            String sourcePath = metadata.getString("filePath");
+            String sourcePath = metadata.getString(AppConstants.FIELD_FILE_PATH);
             String sourceVolume = extractVolumeFromPath(sourcePath);
 
             if (sourceVolume != null && sourceVolume.equals(targetVolume)) {
@@ -226,13 +329,13 @@ public class VolumeManager implements VolumeManagerFacade {
                 return;
             }
 
-            String fileName = metadata.getString("fileName");
+            String fileName = metadata.getString(AppConstants.FIELD_FILE_NAME);
             String targetPath = targetVolume + "/" + fileId + "_" + fileName;
-            long size = metadata.getLong("size");
+            long size = metadata.getLong(AppConstants.FIELD_SIZE);
 
             log.info("Migrating file: {} from {} to {}", fileId, sourcePath, targetPath);
 
-            MigrationTask task = new MigrationTask(fileId, sourcePath, targetPath, size, metadata);
+            MigrationTask task = new MigrationTask(fileId, sourcePath, targetPath, size);
             activeMigrations.put(fileId, task);
 
             journal.migrate(fileId, sourcePath, targetPath, size, metadata)
@@ -244,6 +347,7 @@ public class VolumeManager implements VolumeManagerFacade {
                     })
                     .onFailure(err -> {
                         activeMigrations.remove(fileId);
+                        journal.recordError(fileId, err.getMessage());
                         promise.fail(err);
                     });
         });
@@ -276,6 +380,11 @@ public class VolumeManager implements VolumeManagerFacade {
         return promise.future();
     }
 
+    @Override
+    public Future<Void> recordMigrationError(String fileId, String errorMessage) {
+        return journal.recordError(fileId, errorMessage);
+    }
+
     private Future<List<String>> getFilesOnVolume(String volumePath) {
         Promise<List<String>> promise = Promise.promise();
         List<String> files = new ArrayList<>();
@@ -285,9 +394,9 @@ public class VolumeManager implements VolumeManagerFacade {
                 JsonArray allFiles = filesResult.result();
                 for (int i = 0; i < allFiles.size(); i++) {
                     JsonObject file = allFiles.getJsonObject(i);
-                    String filePath = file.getString("filePath");
+                    String filePath = file.getString(AppConstants.FIELD_FILE_PATH);
                     if (filePath.startsWith(volumePath)) {
-                        files.add(file.getString("fileId"));
+                        files.add(file.getString(AppConstants.FIELD_FILE_ID));
                     }
                 }
                 promise.complete(files);
@@ -350,7 +459,7 @@ public class VolumeManager implements VolumeManagerFacade {
         }
     }
 
-    private String extractVolumeFromPath(String filePath) {
+    private @Nullable String extractVolumeFromPath(String filePath) {
         for (String volume : volumes.keySet()) {
             if (filePath.startsWith(volume)) {
                 return volume;
@@ -366,21 +475,7 @@ public class VolumeManager implements VolumeManagerFacade {
                 .put("volumePath", volumePath)
                 .put("timestamp", System.currentTimeMillis());
 
-        EventBusConfig.eventBus().publish("volume.events", message);
-    }
-
-    private void startHealthChecker() {
-        vertx.setPeriodic(10000, id -> {
-            for (VolumeState state : volumes.values()) {
-                vertx.fileSystem().exists(state.getPath(), result -> {
-                    boolean healthy = result.succeeded() && result.result();
-                    if (healthy != state.isHealthy()) {
-                        state.setHealthy(healthy);
-                        log.warn("Volume {} health changed: {}", state.getPath(), healthy);
-                    }
-                });
-            }
-        });
+        EventBusConfig.eventBus().publish(EventBusConfig.VOLUME_EVENT_ADDRESS, message);
     }
 
     private void recoverAfterCrash() {

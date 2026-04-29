@@ -13,6 +13,7 @@ public class EventBusConfig {
     public static final String MIGRATION_ROLLBACK_ADDRESS = "migration.rollback";
     public static final String MIGRATION_STATUS_ADDRESS = "migration.status";
     public static final String MIGRATION_VOLUME_ADDRESS = "migration.volume";
+    public static final String VOLUME_EVENT_ADDRESS = "volume.events";
     public static EventBus eventBus() {
         return VertxConfig.vertx().eventBus();
     }

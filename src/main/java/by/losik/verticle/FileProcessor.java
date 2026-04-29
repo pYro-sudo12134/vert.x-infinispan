@@ -9,8 +9,6 @@ import java.util.concurrent.atomic.AtomicInteger;
 
 public interface FileProcessor {
 
-    void start(Promise<Void> startPromise);
-
     void handleRequest(Message<Object> message);
 
     void handleUpload(JsonObject msg, Message<Object> message);

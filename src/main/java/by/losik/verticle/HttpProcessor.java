@@ -3,9 +3,6 @@ package by.losik.verticle;
 import io.vertx.ext.web.RoutingContext;
 
 public interface HttpProcessor {
-
-    void start();
-
     void uploadFile(RoutingContext ctx);
 
     void getFile(RoutingContext ctx);

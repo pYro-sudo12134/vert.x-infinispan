@@ -23,6 +23,15 @@ public class AppConstants {
     public static final String FIELD_CONTENT_TYPE = "contentType";
     public static final String FIELD_STATUS = "status";
     public static final String FIELD_FILES = "files";
+    public static final String FIELD_MESSAGE = "message";
+    public static final String FIELD_TARGET_VOLUME = "targetVolume";
+    public static final String FIELD_SOURCE_VOLUME = "sourceVolume";
+    public static  final String FIELD_ERROR = "error";
+    public static final String FIELD_CHECKSUM = "checksum";
+    public static final String FIELD_SOURCE_PATH = "sourcePath";
+    public static final String FIELD_TARGET_PATH = "targetPath";
+    public static final String FIELD_START_TIME = "startTime";
+    public static final String FIELD_DURATION_MS = "durationMs";
 
     public static final String STATUS_OK = "ok";
     public static final String STATUS_UPDATED = "updated";
