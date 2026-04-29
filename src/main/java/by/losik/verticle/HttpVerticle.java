@@ -5,6 +5,8 @@ import by.losik.config.EventBusConfig;
 import by.losik.config.RouterConfig;
 import by.losik.config.VolumeManagerConfig;
 import by.losik.constant.AppConstants;
+import by.losik.volume.MigrationTask;
+import by.losik.volume.VolumeManager;
 import io.vertx.core.AbstractVerticle;
 import io.vertx.core.eventbus.DeliveryOptions;
 import io.vertx.core.file.AsyncFile;
@@ -402,6 +404,12 @@ public class HttpVerticle extends AbstractVerticle implements HttpProcessor {
             return;
         }
 
+        if (VolumeManagerConfig.volumeManager().isVolumeReadOnly(targetVolume)) {
+            ctx.response().setStatusCode(AppConstants.HTTP_BAD_REQUEST)
+                    .end("Target volume is read-only: " + targetVolume);
+            return;
+        }
+
         EventBusConfig.eventBus().send(EventBusConfig.MIGRATION_EXECUTE_ADDRESS,
                 new JsonObject()
                         .put("fileId", fileId)
@@ -424,17 +432,24 @@ public class HttpVerticle extends AbstractVerticle implements HttpProcessor {
             return;
         }
 
-        EventBusConfig.eventBus().<JsonObject>request(EventBusConfig.MIGRATION_STATUS_ADDRESS,
-                new JsonObject().put("fileId", fileId),
-                reply -> {
-                    if (reply.succeeded()) {
-                        ctx.response().end(reply.result().body().encode());
-                    } else {
-                        ctx.response().setStatusCode(AppConstants.HTTP_INTERNAL_ERROR).end(new JsonObject()
-                                .put("error", reply.cause().getMessage())
-                                .encode());
-                    }
-                });
+        VolumeManager vm = VolumeManagerConfig.volumeManager();
+
+        Optional<MigrationTask> active = vm.getMigrationStatus(fileId);
+        if (active.isPresent()) {
+            ctx.response().end(active.get().toJson().encode());
+            return;
+        }
+
+        vm.getJournalStatusFromFile(fileId).onComplete(statusResult -> {
+            if (statusResult.succeeded()) {
+                ctx.response().end(statusResult.result().encode());
+            } else {
+                ctx.response().setStatusCode(AppConstants.HTTP_BAD_REQUEST).end(new JsonObject()
+                        .put(AppConstants.FIELD_STATUS, AppConstants.ERR_FILE_NOT_FOUND)
+                        .put(AppConstants.FIELD_FILE_ID, fileId)
+                        .encode());
+            }
+        });
     }
 
     @Override

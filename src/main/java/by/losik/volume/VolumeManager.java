@@ -394,6 +394,11 @@ public class VolumeManager implements VolumeManagerFacade {
     }
 
     @Override
+    public Future<JsonObject> getJournalStatusFromFile(String fileId) {
+        return journal.getMigrationStatusFromFile(fileId);
+    }
+
+    @Override
     public void incrementFileCount(String volumePath) {
         VolumeState state = volumes.get(volumePath);
         if (state != null) {

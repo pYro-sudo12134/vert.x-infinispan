@@ -1,6 +1,5 @@
 package by.losik.volume;
 
-import by.losik.config.EventBusConfig;
 import by.losik.meta.FileMetadata;
 import by.losik.util.MetadataHelper;
 import io.vertx.core.AsyncResult;
@@ -32,10 +31,17 @@ public class MigrationJournal {
     private final String journalPath;
     private final Map<String, JournalEntry> entries = new ConcurrentHashMap<>();
 
-    public MigrationJournal(Vertx vertx, String journalPath) {
+    public MigrationJournal(@NotNull Vertx vertx, @NotNull String journalPath) {
         this.vertx = vertx;
         this.journalPath = journalPath;
-        loadJournal();
+
+        String dir = journalPath.substring(0, journalPath.lastIndexOf('/'));
+        vertx.fileSystem().mkdirs(dir, mkdir -> {
+            if (mkdir.failed()) {
+                log.warn("Failed to create directory: {}", dir, mkdir.cause());
+            }
+            loadJournal();
+        });
     }
 
     public Future<Void> migrate(String fileId, String sourcePath, String targetPath,
@@ -290,54 +296,135 @@ public class MigrationJournal {
         Promise<Void> promise = Promise.promise();
 
         List<JournalEntry> pending = entries.values().stream()
-                .filter(e -> e.getStatus() == Status.READY)
+                .filter(e -> e.getStatus() != Status.COMMITTED && e.getStatus() != Status.ROLLED_BACK)
                 .toList();
 
         if (pending.isEmpty()) {
+            log.info("No pending migrations found");
             promise.complete();
             return promise.future();
         }
 
-        log.info("Found {} pending migrations, attempting recovery", pending.size());
+        log.info("Found {} incomplete migrations, attempting recovery", pending.size());
 
         AtomicInteger recovered = new AtomicInteger(0);
         AtomicInteger failed = new AtomicInteger(0);
+        AtomicInteger rolledBack = new AtomicInteger(0);
 
         for (JournalEntry entry : pending) {
-            MetadataHelper.getMetadata(entry.getFileId()).onComplete(metadataResult -> {
-                if (metadataResult.succeeded()) {
-                    JsonObject metadata = metadataResult.result();
-
-                    String currentPath = metadata.getString("filePath");
-                    if (currentPath.equals(entry.getTargetPath())) {
-                        entry.setStatus(Status.COMMITTED);
-                        persistJournal();
-                        recovered.incrementAndGet();
-                    } else {
-                        commitMigration(entry, metadata)
-                                .onSuccess(v -> {
-                                    entry.setStatus(Status.COMMITTED);
-                                    persistJournal();
-                                    recovered.incrementAndGet();
-                                })
-                                .onFailure(err -> {
-                                    log.error("Recovery failed for file: {}", entry.getFileId(), err);
-                                    failed.incrementAndGet();
-                                });
+            switch (entry.getStatus()) {
+                case READY -> {
+                    log.info("Recovering READY migration for file: {}", entry.getFileId());
+                    recoverReadyMigration(entry, recovered, failed, rolledBack, pending.size(), promise);
+                }
+                case COPYING -> {
+                    log.warn("Found COPYING migration for file: {}, will rollback", entry.getFileId());
+                    rollbackMigration(entry, rolledBack, failed, pending.size(), promise);
+                }
+                case PENDING -> {
+                    log.warn("Found PENDING migration for file: {}, will rollback", entry.getFileId());
+                    rollbackMigration(entry, rolledBack, failed, pending.size(), promise);
+                }
+                case FAILED -> {
+                    log.info("Cleaning up FAILED migration for file: {}", entry.getFileId());
+                    cleanupFailedMigration(entry, recovered, pending.size(), promise);
+                }
+                default -> {
+                    log.warn("Unknown status {} for file: {}, skipping", entry.getStatus(), entry.getFileId());
+                    if (recovered.get() + failed.get() + rolledBack.get() == pending.size()) {
+                        promise.complete();
                     }
-                } else {
-                    log.error("Failed to get metadata for file: {}", entry.getFileId());
-                    failed.incrementAndGet();
                 }
-
-                if (recovered.get() + failed.get() == pending.size()) {
-                    log.info("Recovery completed: recovered={}, failed={}", recovered.get(), failed.get());
-                    promise.complete();
-                }
-            });
+            }
         }
 
         return promise.future();
+    }
+
+    private void recoverReadyMigration(JournalEntry entry, AtomicInteger recovered,
+                                       AtomicInteger failed, AtomicInteger rolledBack,
+                                       int total, Promise<Void> promise) {
+        MetadataHelper.getMetadata(entry.getFileId()).onComplete(metadataResult -> {
+            if (metadataResult.succeeded()) {
+                JsonObject metadata = metadataResult.result();
+                String currentPath = metadata.getString("filePath");
+
+                if (currentPath.equals(entry.getTargetPath())) {
+                    entry.setStatus(Status.COMMITTED);
+                    persistJournal();
+                    log.info("Recovery: file {} already at target, marked COMMITTED", entry.getFileId());
+                    recovered.incrementAndGet();
+                } else {
+                    commitMigration(entry, metadata)
+                            .onSuccess(v -> {
+                                entry.setStatus(Status.COMMITTED);
+                                persistJournal();
+                                log.info("Recovery: migration completed for {}", entry.getFileId());
+                                recovered.incrementAndGet();
+                            })
+                            .onFailure(err -> {
+                                log.error("Recovery: failed to commit migration for {}", entry.getFileId(), err);
+                                failed.incrementAndGet();
+                            });
+                }
+            } else {
+                log.error("Recovery: failed to get metadata for {}", entry.getFileId());
+                failed.incrementAndGet();
+            }
+
+            checkRecoveryCompletion(recovered, failed, rolledBack, total, promise);
+        });
+    }
+
+    private void rollbackMigration(JournalEntry entry, AtomicInteger rolledBack,
+                                   AtomicInteger failed, int total, Promise<Void> promise) {
+        vertx.fileSystem().exists(entry.getTargetPath(), exists -> {
+            if (exists.succeeded() && exists.result()) {
+                vertx.fileSystem().delete(entry.getTargetPath(), delete -> {
+                    if (delete.succeeded()) {
+                        log.info("Recovery: deleted temp file for {}", entry.getFileId());
+                    } else {
+                        log.warn("Recovery: failed to delete temp file for {}", entry.getFileId());
+                    }
+                });
+            }
+
+            entry.setStatus(Status.ROLLED_BACK);
+            persistJournal();
+            rolledBack.incrementAndGet();
+            checkRecoveryCompletion(null, null, rolledBack, total, promise);
+        });
+    }
+
+    private void cleanupFailedMigration(JournalEntry entry, AtomicInteger recovered,
+                                        int total, Promise<Void> promise) {
+        vertx.fileSystem().exists(entry.getTargetPath(), exists -> {
+            if (exists.succeeded() && exists.result()) {
+                vertx.fileSystem().delete(entry.getTargetPath(), delete -> {
+                    if (delete.succeeded()) {
+                        log.info("Recovery: cleaned up failed migration temp file for {}", entry.getFileId());
+                    }
+                });
+            }
+
+            entries.remove(entry.getId());
+            persistJournal();
+            recovered.incrementAndGet();
+            checkRecoveryCompletion(recovered, null, null, total, promise);
+        });
+    }
+
+    private void checkRecoveryCompletion(AtomicInteger recovered, AtomicInteger failed,
+                                         AtomicInteger rolledBack, int total,
+                                         Promise<Void> promise) {
+        int rec = recovered != null ? recovered.get() : 0;
+        int fail = failed != null ? failed.get() : 0;
+        int rb = rolledBack != null ? rolledBack.get() : 0;
+
+        if (rec + fail + rb == total) {
+            log.info("Recovery completed: recovered={}, failed={}, rolledBack={}", rec, fail, rb);
+            promise.complete();
+        }
     }
 
     private void loadJournal() {
@@ -355,38 +442,75 @@ public class MigrationJournal {
                                         entry.getStatus(), entry.getFileId());
                             }
                         }
+                        log.info("Journal loaded from {}: {} entries", journalPath, entries.size());
+                    } else {
+                        log.warn("Failed to read journal file", read.cause());
+                        createEmptyJournal();
                     }
                 });
+            } else {
+                createEmptyJournal();
+            }
+        });
+    }
+
+    private void createEmptyJournal() {
+        vertx.fileSystem().writeFile(journalPath, new JsonArray().toBuffer(), write -> {
+            if (write.succeeded()) {
+                log.info("Created new journal file: {}", journalPath);
+            } else {
+                log.error("Failed to create journal file: {}", journalPath, write.cause());
             }
         });
     }
 
     private void persistJournal() {
+        if (entries.isEmpty()) {
+            log.debug("No entries to persist, skipping");
+            return;
+        }
+
         JsonArray array = new JsonArray();
         for (JournalEntry entry : entries.values()) {
             array.add(entry.toJson());
         }
-        vertx.fileSystem().writeFile(journalPath, array.toBuffer());
+
+        vertx.fileSystem().writeFile(journalPath, array.toBuffer(), write -> {
+            if (write.succeeded()) {
+                log.debug("Journal persisted: {} entries", entries.size());
+            } else {
+                log.error("Failed to persist journal: {}", journalPath, write.cause());
+            }
+        });
     }
 
-    public Future<JsonObject> getMigrationStatus(String fileId) {
+    public Future<JsonObject> getMigrationStatusFromFile(String fileId) {
         Promise<JsonObject> promise = Promise.promise();
 
-        JournalEntry entry = entries.values().stream()
-                .filter(e -> e.getFileId().equals(fileId))
-                .findFirst()
-                .orElse(null);
+        vertx.fileSystem().readFile(journalPath, readResult -> {
+            if (readResult.failed()) {
+                promise.fail("Failed to read journal: " + readResult.cause().getMessage());
+                return;
+            }
 
-        if (entry == null) {
+            JsonArray array = new JsonArray(readResult.result());
+            for (int i = 0; i < array.size(); i++) {
+                JsonObject entry = array.getJsonObject(i);
+                if (entry.getString("fileId").equals(fileId)) {
+                    promise.complete(new JsonObject()
+                            .put("status", entry.getString("status"))
+                            .put("error", entry.getString("error", ""))
+                            .put("checksum", entry.getString("checksum", ""))
+                            .put("sourcePath", entry.getString("sourcePath"))
+                            .put("targetPath", entry.getString("targetPath"))
+                            .put("size", entry.getLong("size"))
+                            .put("createdAt", entry.getString("createdAt"))
+                            .put("updatedAt", entry.getString("updatedAt")));
+                    return;
+                }
+            }
             promise.fail("No migration found for file: " + fileId);
-        } else {
-            promise.complete(new JsonObject()
-                    .put("status", entry.getStatus().toString())
-                    .put("error", entry.getErrorMessage() != null ? entry.getErrorMessage() : "")
-                    .put("checksum", entry.getChecksum() != null ? entry.getChecksum() : "")
-                    .put("createdAt", entry.createdAt.toString())
-                    .put("updatedAt", entry.updatedAt.toString()));
-        }
+        });
 
         return promise.future();
     }

@@ -24,7 +24,7 @@ public interface VolumeManagerFacade {
     Future<Void> migrateFile(String fileId, String targetVolume);
 
     Optional<MigrationTask> getMigrationStatus(String fileId);
-
+    Future<JsonObject> getJournalStatusFromFile(String fileId);
     Future<Void> rollbackMigration(String fileId);
 
     void incrementFileCount(String volumePath);

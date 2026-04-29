@@ -47,6 +47,7 @@ services:
       - JGROUPS_EXTERNAL_ADDR=localhost
       - JGROUPS_EXTERNAL_PORT=7800
     volumes:
+      - journal-data-1:/data
       - nfs-storage-1:/mnt/nfs1
       - nfs-storage-2:/mnt/nfs2
       - nfs-storage-3:/mnt/nfs3
@@ -79,6 +80,7 @@ services:
       - JGROUPS_EXTERNAL_ADDR=localhost
       - JGROUPS_EXTERNAL_PORT=7800
     volumes:
+      - journal-data-2:/data
       - nfs-storage-1:/mnt/nfs1
       - nfs-storage-2:/mnt/nfs2
       - nfs-storage-3:/mnt/nfs3
@@ -112,6 +114,7 @@ services:
       - JGROUPS_EXTERNAL_ADDR=localhost
       - JGROUPS_EXTERNAL_PORT=7800
     volumes:
+      - journal-data-3:/data
       - nfs-storage-1:/mnt/nfs1
       - nfs-storage-2:/mnt/nfs2
       - nfs-storage-3:/mnt/nfs3
@@ -132,6 +135,9 @@ volumes:
   nfs-storage-1:
   nfs-storage-2:
   nfs-storage-3:
+  journal-data-1:
+  journal-data-2:
+  journal-data-3:
 
 networks:
   vertx-net:

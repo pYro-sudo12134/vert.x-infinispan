@@ -58,7 +58,7 @@ public class VolumeSelector {
             return v;
         });
 
-        log.debug("Selected volume '{}' for file '{}' using strategy '{}' (readOnly excluded)",
+        log.debug("Selected volume '{}' for file '{}' using strategy '{}'",
                 selected, metadata.getFileId(), strategy.getName());
 
         return selected;
