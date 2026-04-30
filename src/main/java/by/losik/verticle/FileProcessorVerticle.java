@@ -43,14 +43,13 @@ public class FileProcessorVerticle extends AbstractVerticle implements FileProce
     private static final Logger log = LoggerFactory.getLogger(FileProcessorVerticle.class);
     public static final String FILE_METADATA_MAP = "file.metadata";
     private static final String FILE_METADATA_MAP_INDEXED = "file.metadata.indexed";
-
     private AsyncMap<String, FileMetadata> fileMetadataMap;
     private FileQueryService queryService;
     private VolumeManagerFacade volumeManager;
 
     @Override
     public void start(Promise<Void> startPromise) {
-        String nodeId = AppConfig.get().getString("node.id", "unknown");
+        String nodeId = AppConfig.nodeId();
 
         volumeManager = new VolumeManager(vertx, nodeId);
 
@@ -868,29 +867,32 @@ public class FileProcessorVerticle extends AbstractVerticle implements FileProce
     }
 
     private void syncToIndexedCache(String fileId, FileMetadata metadata) {
-        if (queryService != null) {
-            try {
-                ClusterManagerConfig.getCacheContainer()
-                        .getCache(FILE_METADATA_MAP_INDEXED)
-                        .put(fileId, metadata);
-                log.debug("Synced to indexed cache: fileId={}", fileId);
-            } catch (Exception e) {
-                log.warn("Failed to sync to indexed cache: {}", e.getMessage());
-            }
-        }
+        Optional.ofNullable(queryService).ifPresent(
+                fileQueryService -> {
+                    try {
+                        ClusterManagerConfig.getCacheContainer()
+                                .getCache(FILE_METADATA_MAP_INDEXED)
+                                .put(fileId, metadata);
+                        log.debug("Synced to indexed cache: fileId={}", fileId);
+                    } catch (Exception e) {
+                        log.warn("Failed to sync to indexed cache: {}", e.getMessage());
+                    }
+                }
+        );
     }
 
     private void removeFromIndexedCache(String fileId) {
-        if (queryService != null) {
-            try {
-                ClusterManagerConfig.getCacheContainer()
-                        .getCache(FILE_METADATA_MAP_INDEXED)
-                        .remove(fileId);
-                log.debug("Removed from indexed cache: fileId={}", fileId);
-            } catch (Exception e) {
-                log.warn("Failed to remove from indexed cache: {}", e.getMessage());
-            }
-        }
+        Optional.ofNullable(queryService).ifPresent(
+                fileQueryService -> {
+                    try {
+                        ClusterManagerConfig.getCacheContainer()
+                                .getCache(FILE_METADATA_MAP_INDEXED)
+                                .remove(fileId);
+                        log.debug("Removed from indexed cache: fileId={}", fileId);
+                    } catch (Exception e) {
+                        log.warn("Failed to remove from indexed cache: {}", e.getMessage());
+                    }
+                });
     }
 
     private JsonObject metadataToJson(@NotNull FileMetadata m) {

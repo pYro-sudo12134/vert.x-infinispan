@@ -1,5 +1,6 @@
 package by.losik.service;
 
+import by.losik.constant.AppConstants;
 import by.losik.meta.FileMetadata;
 import io.vertx.core.Future;
 import io.vertx.core.Promise;
@@ -14,6 +15,8 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.util.List;
+import java.util.Optional;
+import java.util.stream.Collectors;
 
 public class FileQueryService {
     private static final Logger log = LoggerFactory.getLogger(FileQueryService.class);
@@ -43,28 +46,27 @@ public class FileQueryService {
                 queryString.append(ascending ? " ASC" : " DESC");
 
                 Query<FileMetadata> query = queryFactory.create(queryString.toString());
+
                 if (prefix != null && !prefix.isEmpty()) {
                     query.setParameter("prefix", prefix + "%");
                 }
 
                 long total = query.execute().hitCount().orElse(0L);
 
-                int offset = (page - 1) * size;
-                query.startOffset(offset).maxResults(size);
+                query.startOffset((long) (page - 1) * size).maxResults(size);
 
-                List<FileMetadata> resultList = query.list();
-
-                JsonArray filesArray = new JsonArray();
-                for (FileMetadata meta : resultList) {
-                    filesArray.add(new JsonObject()
-                            .put("fileId", meta.getFileId())
-                            .put("fileName", meta.getFileName())
-                            .put("filePath", meta.getFilePath())
-                            .put("contentType", meta.getContentType())
-                            .put("size", meta.getSize())
-                            .put("createdAt", meta.getCreatedAt().toString())
-                            .put("updatedAt", meta.getUpdatedAt().toString()));
-                }
+                JsonArray filesArray = new JsonArray(
+                        query.list()
+                                .stream().map(metadata ->
+                                        new JsonObject()
+                                                .put(AppConstants.FIELD_FILE_ID, metadata.getFileId())
+                                                .put(AppConstants.FIELD_FILE_NAME, metadata.getFileName())
+                                                .put(AppConstants.FIELD_FILE_PATH, metadata.getFilePath())
+                                                .put(AppConstants.FIELD_CONTENT_TYPE, metadata.getContentType())
+                                                .put(AppConstants.FIELD_SIZE, metadata.getSize())
+                                                .put(AppConstants.FIELD_CREATED_AT, metadata.getCreatedAt().toString())
+                                                .put(AppConstants.FIELD_UPDATED_AT, metadata.getUpdatedAt().toString()))
+                                .collect(Collectors.toList()));
 
                 log.info("List returned {} files (total: {})", filesArray.size(), total);
 

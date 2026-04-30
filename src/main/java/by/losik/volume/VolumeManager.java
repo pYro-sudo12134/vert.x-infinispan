@@ -10,11 +10,14 @@ import io.vertx.core.Promise;
 import io.vertx.core.Vertx;
 import io.vertx.core.json.JsonArray;
 import io.vertx.core.json.JsonObject;
+import io.vertx.core.shareddata.AsyncMap;
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.io.Serial;
+import java.io.Serializable;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
@@ -25,11 +28,12 @@ import java.util.concurrent.atomic.AtomicLong;
 
 public class VolumeManager implements VolumeManagerFacade {
     private static final Logger log = LoggerFactory.getLogger(VolumeManager.class);
-
+    private static final String VOLUME_STATS_MAP = "volume.stats";
     private final Vertx vertx;
     private final String nodeId;
     private final VolumeSelector selector;
     private final MigrationJournal journal;
+    private AsyncMap<String, VolumeStats> volumeStatsMap;
     private final Map<String, VolumeState> volumes = new ConcurrentHashMap<>();
     private final Map<String, MigrationTask> activeMigrations = new ConcurrentHashMap<>();
 
@@ -39,10 +43,22 @@ public class VolumeManager implements VolumeManagerFacade {
         this.selector = new VolumeSelector(this);
         this.journal = new MigrationJournal(vertx, "/data/migration-journal.json");
 
+        initVolumeStatsMap();
         initVolumes();
         startHealthChecker();
         recoverAfterCrash();
         listenVolumeEvents();
+    }
+
+    private void initVolumeStatsMap() {
+        vertx.sharedData().<String, VolumeStats>getClusterWideMap(VOLUME_STATS_MAP, ar -> {
+            if (ar.succeeded()) {
+                volumeStatsMap = ar.result();
+                log.info("Volume stats map initialized");
+            } else {
+                log.error("Failed to initialize volume stats map", ar.cause());
+            }
+        });
     }
 
     private void initVolumes() {
@@ -58,14 +74,47 @@ public class VolumeManager implements VolumeManagerFacade {
             }
 
             volumes.put(volumePath, state);
+            loadVolumeStats(volumePath, state);
+        }
+    }
 
+    private void loadVolumeStats(String volumePath, VolumeState state) {
+        if (volumeStatsMap == null) {
             countFilesOnVolume(volumePath).onSuccess(count -> {
                 state.setFileCount(count);
-                selector.updateVolumeStats(volumePath, count, 0);
-                log.info("Volume {} initialized with {} files, readOnly={}",
-                        volumePath, count, state.isReadOnly());
+                log.info("Volume {} initialized with {} files (local fallback)", volumePath, count);
             });
+            return;
         }
+
+        volumeStatsMap.get(volumePath, getResult -> {
+            if (getResult.succeeded() && getResult.result() != null) {
+                VolumeStats stats = getResult.result();
+                state.setFileCount(stats.fileCount());
+                state.setUsedSpace(stats.usedSpace());
+                selector.updateVolumeStats(volumePath, stats.fileCount(), stats.usedSpace());
+                log.info("Volume {} initialized with {} files (from cluster)", volumePath, stats.fileCount());
+            } else {
+                countFilesOnVolume(volumePath).onSuccess(count -> {
+                    state.setFileCount(count);
+                    updateVolumeStatsInCluster(volumePath, count, 0);
+                    log.info("Volume {} initialized with {} files (local, saved to cluster)", volumePath, count);
+                });
+            }
+        });
+    }
+
+    private void updateVolumeStatsInCluster(String volumePath, long fileCount, long usedSpace) {
+        if (volumeStatsMap == null) return;
+
+        VolumeStats stats = new VolumeStats(volumePath, fileCount, usedSpace, nodeId, System.currentTimeMillis());
+        volumeStatsMap.put(volumePath, stats, putResult -> {
+            if (putResult.succeeded()) {
+                log.debug("Updated volume stats in cluster: {} -> {} files", volumePath, fileCount);
+            } else {
+                log.warn("Failed to update volume stats in cluster: {}", volumePath, putResult.cause());
+            }
+        });
     }
 
     private void listenVolumeEvents() {
@@ -89,8 +138,37 @@ public class VolumeManager implements VolumeManagerFacade {
             } else if ("volume_removed".equals(type)) {
                 log.info("Detected volume {} removed by node {}", volumePath, sourceNode);
                 volumes.remove(volumePath);
+            } else if ("file_count_changed".equals(type)) {
+                long newCount = body.getLong("fileCount", 0L);
+                VolumeState state = volumes.get(volumePath);
+                if (state != null) {
+                    state.setFileCount(newCount);
+                    selector.updateVolumeStats(volumePath, newCount, state.getUsedSpace());
+                    log.debug("Updated file count for {} from node {}: {}", volumePath, sourceNode, newCount);
+                }
             }
         });
+    }
+
+    private void broadcastVolumeEvent(String event, String volumePath) {
+        JsonObject message = new JsonObject()
+                .put("type", event)
+                .put("nodeId", nodeId)
+                .put("volumePath", volumePath)
+                .put("timestamp", System.currentTimeMillis());
+
+        EventBusConfig.eventBus().publish(EventBusConfig.VOLUME_EVENT_ADDRESS, message);
+    }
+
+    private void broadcastFileCountChange(String volumePath, long newCount) {
+        JsonObject message = new JsonObject()
+                .put("type", "file_count_changed")
+                .put("nodeId", nodeId)
+                .put("volumePath", volumePath)
+                .put("fileCount", newCount)
+                .put("timestamp", System.currentTimeMillis());
+
+        EventBusConfig.eventBus().publish(EventBusConfig.VOLUME_EVENT_ADDRESS, message);
     }
 
     private void startHealthChecker() {
@@ -119,6 +197,7 @@ public class VolumeManager implements VolumeManagerFacade {
                             countFilesOnVolume(volumePath).onSuccess(count -> {
                                 newState.setFileCount(count);
                                 selector.updateVolumeStats(volumePath, count, 0);
+                                updateVolumeStatsInCluster(volumePath, count, 0);
                                 log.info("New volume {} initialized with {} files", volumePath, count);
                             });
                         } else {
@@ -196,6 +275,7 @@ public class VolumeManager implements VolumeManagerFacade {
         VolumeState state = new VolumeState(volumePath);
         state.setHealthy(true);
         volumes.put(volumePath, state);
+        updateVolumeStatsInCluster(volumePath, 0, 0);
 
         broadcastVolumeEvent("volume_added", volumePath);
 
@@ -237,6 +317,9 @@ public class VolumeManager implements VolumeManagerFacade {
                 .compose(v -> unmountVolume(volumePath))
                 .onSuccess(v -> {
                     volumes.remove(volumePath);
+                    if (volumeStatsMap != null) {
+                        volumeStatsMap.remove(volumePath);
+                    }
                     broadcastVolumeEvent("volume_removed", volumePath);
                     promise.complete();
                 })
@@ -254,6 +337,9 @@ public class VolumeManager implements VolumeManagerFacade {
 
             if (!configuredVolumes.contains(volumePath) && !state.isHealthy() && state.getFileCount() == 0) {
                 log.info("Removing stale volume from memory: {}", volumePath);
+                if (volumeStatsMap != null) {
+                    volumeStatsMap.remove(volumePath);
+                }
                 return true;
             }
             return false;
@@ -454,8 +540,12 @@ public class VolumeManager implements VolumeManagerFacade {
     private void updateVolumeStatistics(String volumePath, int delta) {
         VolumeState state = volumes.get(volumePath);
         if (state != null) {
-            state.setFileCount(state.getFileCount() + delta);
-            selector.updateVolumeStats(volumePath, state.getFileCount(), 0);
+            long newCount = state.getFileCount() + delta;
+            state.setFileCount(newCount);
+            selector.updateVolumeStats(volumePath, newCount, state.getUsedSpace());
+            updateVolumeStatsInCluster(volumePath, newCount, state.getUsedSpace());
+            broadcastFileCountChange(volumePath, newCount);
+            log.debug("Volume {} stats updated: {} -> {} files", volumePath, state.getFileCount() - delta, newCount);
         }
     }
 
@@ -466,16 +556,6 @@ public class VolumeManager implements VolumeManagerFacade {
             }
         }
         return null;
-    }
-
-    private void broadcastVolumeEvent(String event, String volumePath) {
-        JsonObject message = new JsonObject()
-                .put("type", "volume_" + event)
-                .put("nodeId", nodeId)
-                .put("volumePath", volumePath)
-                .put("timestamp", System.currentTimeMillis());
-
-        EventBusConfig.eventBus().publish(EventBusConfig.VOLUME_EVENT_ADDRESS, message);
     }
 
     private void recoverAfterCrash() {
@@ -495,22 +575,12 @@ public class VolumeManager implements VolumeManagerFacade {
 
     @Override
     public void incrementFileCount(String volumePath) {
-        VolumeState state = volumes.get(volumePath);
-        if (state != null) {
-            long newCount = state.incrementAndGetFileCount();
-            selector.updateVolumeStats(volumePath, newCount, state.getUsedSpace());
-            log.debug("Volume {} file count increased to {}", volumePath, newCount);
-        }
+        updateVolumeStatistics(volumePath, +1);
     }
 
     @Override
     public void decrementFileCount(String volumePath) {
-        VolumeState state = volumes.get(volumePath);
-        if (state != null) {
-            long newCount = state.decrementAndGetFileCount();
-            selector.updateVolumeStats(volumePath, newCount, state.getUsedSpace());
-            log.debug("Volume {} file count decreased to {}", volumePath, newCount);
-        }
+        updateVolumeStatistics(volumePath, -1);
     }
 
     @Override
@@ -537,5 +607,12 @@ public class VolumeManager implements VolumeManagerFacade {
     public boolean isVolumeReadOnly(String volumePath) {
         VolumeState state = volumes.get(volumePath);
         return state != null && state.isReadOnly();
+    }
+
+    public record VolumeStats(String volumePath, long fileCount, long usedSpace, String updatedBy,
+                              long updatedAt) implements Serializable {
+            @Serial
+            private static final long serialVersionUID = 1L;
+
     }
 }

@@ -322,11 +322,11 @@ public class MigrationJournal {
                 }
                 case COPYING -> {
                     log.warn("Found COPYING migration for file: {}, will rollback", entry.getFileId());
-                    rollbackMigration(entry, rolledBack, failed, pending.size(), promise);
+                    rollbackMigration(entry, rolledBack, pending.size(), promise);
                 }
                 case PENDING -> {
                     log.warn("Found PENDING migration for file: {}, will rollback", entry.getFileId());
-                    rollbackMigration(entry, rolledBack, failed, pending.size(), promise);
+                    rollbackMigration(entry, rolledBack, pending.size(), promise);
                 }
                 case FAILED -> {
                     log.info("Cleaning up FAILED migration for file: {}", entry.getFileId());
@@ -380,7 +380,7 @@ public class MigrationJournal {
     }
 
     private void rollbackMigration(JournalEntry entry, AtomicInteger rolledBack,
-                                   AtomicInteger failed, int total, Promise<Void> promise) {
+                                   int total, Promise<Void> promise) {
         vertx.fileSystem().exists(entry.getTargetPath(), exists -> {
             if (exists.succeeded() && exists.result()) {
                 vertx.fileSystem().delete(entry.getTargetPath(), delete -> {
