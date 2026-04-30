@@ -26,4 +26,4 @@ USER vertx:vertx
 
 EXPOSE 8080 8079 7800
 
-ENTRYPOINT ["java", "-jar", "-Djava.io.tmpdir=/tmp", "app.jar"]
+ENTRYPOINT ["java", "-jar", "-XX:+UseContainerSupport", "-Djava.io.tmpdir=/tmp", "app.jar"]
