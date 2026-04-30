@@ -3,8 +3,6 @@ package by.losik.config;
 import io.vertx.core.spi.cluster.ClusterManager;
 import io.vertx.ext.cluster.infinispan.InfinispanClusterManager;
 import org.infinispan.api.exception.InfinispanException;
-import org.infinispan.configuration.global.GlobalConfigurationBuilder;
-import org.infinispan.jboss.marshalling.core.JBossUserMarshaller;
 import org.infinispan.manager.EmbeddedCacheManager;
 import org.jetbrains.annotations.Contract;
 import org.jetbrains.annotations.NotNull;
@@ -16,9 +14,6 @@ public class ClusterManagerConfig {
         if(clusterManagerInstance == null) {
             System.setProperty("jgroups.bind_addr", System.getenv().getOrDefault("JGROUPS_BIND_ADDR", "0.0.0.0"));
             System.setProperty("jgroups.tcp.port", System.getenv().getOrDefault("JGROUPS_TCP_PORT", "7800"));
-
-            GlobalConfigurationBuilder globalConfig = GlobalConfigurationBuilder.defaultClusteredBuilder();
-            globalConfig.serialization().marshaller(new JBossUserMarshaller());
 
             clusterManagerInstance = new InfinispanClusterManager();
 
